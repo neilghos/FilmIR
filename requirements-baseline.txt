@@ -1,0 +1,4 @@
+beir
+sentence-transformers
+torch
+numpy

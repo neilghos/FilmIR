@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtual environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Editors and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Downloaded datasets and generated experiment artifacts
+/data/*
+/runs/*
+
+# Embeddings, checkpoints, and ranking outputs
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.npy
+*.npz
+*.jsonl
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+/tmp/
