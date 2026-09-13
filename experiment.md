@@ -1,91 +1,40 @@
-# Experiment Plan
+Best replacement: TREC Deep Learning
+Use the TREC Deep Learning passage-ranking benchmark as the primary benchmark.
+It has:
 
-## Goal
+- 8.8M-passage corpus
+- Hundreds of thousands of training queries
+- Official train/dev qrels
+- Blind, deeply judged test queries
+- Standard NDCG/MRR evaluation
+- Strong BM25, DPR, ColBERT, BERT, and dense-retrieval baselines
+  The official MS MARCO/TREC release provides 532k training qrels, development qrels, and held-out TREC test queries with deeper relevance judgments. Official dataset documentation and TREC DL overview.
+  This gives us the clean experiment:
+  Frozen encoder
+  → train FiLM conditioner on train qrels
+  → select hyperparameters on dev
+  → evaluate once on TREC DL test
+  No cross-domain transfer is required.
+  Best genuinely different benchmark: TREC CAR
+  Use TREC Complex Answer Retrieval as the second benchmark.
+  It provides:
+- Training data
+- Held-out test topics
+- Passage-level qrels
+- Hierarchical/complex information needs
+- Manual graded relevance judgments
+- Official TREC evaluation infrastructure
+  It is especially suitable because query-conditioned modulation may help when the query expresses a complex information need. TREC CAR official release and TREC CAR overview.
+  Optional third benchmark: MIRACL
+  MIRACL is a strong option if we want multilingual generalization. It has train/dev/test splits, 78k queries, 18 languages, and over 726k human relevance judgments. MIRACL paper.
+  However, we would need a multilingual encoder such as mContriever or multilingual E5.
+  What I would use for the paper
 
-Test whether a query-conditioned FiLM adapter improves frozen dense retrieval
-representations across retrieval backbones and datasets.
+1. TREC DL — main supervised benchmark.
+2. TREC CAR — complex retrieval benchmark.
+3. MIRACL — optional multilingual extension.
+4. BRIGHT — evaluation-only stress test, not the main training benchmark; it has only about 1,385 reasoning-intensive queries. BRIGHT.
+   The cleanest paper claim becomes:
+   Query-conditioned FiLM improves frozen dense retrieval when trained with relevance supervision, across standard passage retrieval and complex-answer retrieval tasks.
 
-Metric: NDCG@10 over the full BEIR corpus.
-
-## Result tables
-
-### Table 1: Full supervised in-domain adaptation
-
-Train one FiLM adapter per dataset using the official training qrels. Use the
-development split for selection when available and evaluate once on test.
-
-Datasets:
-
-- MSMARCO, using a fixed 2,000--3,000-example training subset.
-- NFCorpus
-- NQ
-- HotpotQA
-- FiQA
-- FEVER
-- SciFact
-
-For datasets without an official development split, create a fixed validation
-split from the training queries. The MSMARCO subset and all validation splits
-must be fixed before test evaluation.
-
-### Table 2: Zero-shot cross-dataset transfer
-
-Train one pooled FiLM adapter on the training data from source datasets, then
-evaluate on a held-out target dataset whose training qrels were not used.
-Use leave-one-dataset-out evaluation where practical.
-
-This is true zero-shot transfer for the adapter. A pooled adapter trained on
-all datasets and evaluated on those same datasets is multi-dataset supervised
-adaptation, not zero-shot; report it separately if included.
-
-### Table 3: Few-shot target adaptation
-
-Start from the pooled source-only adapter and adapt it using a small target
-support set. Evaluate on untouched target test queries.
-
-Support sizes:
-
-```text
-k in {2, 4, 8, 16, 32}
-```
-
-Repeat support sampling over multiple seeds and report mean and standard
-deviation. Support queries must not appear in the evaluation set.
-
-## Baseline systems
-
-Core systems:
-
-- BM25: standalone sparse lexical baseline.
-- MiniLM: compact general-purpose dense encoder.
-- MultiQA: QA-specialized dense encoder.
-- BGE: modern general-purpose dense encoder.
-- E5: retrieval-specialized contrastive encoder with query/passage prefixes.
-- Contriever: unsupervised contrastive dense encoder.
-- DPR: classic supervised QA dual encoder with separate question and passage
-  encoders.
-
-SPLADE is excluded from the FiLM experiments because it is a sparse neural
-retriever and is not directly compatible with the current dense FiLM adapter.
-It may be reported only as a standalone sparse baseline if needed.
-
-## FiLM configuration
-
-Use one globally fixed configuration before the main comparison:
-
-```text
-parameterization: polar
-hidden dimension: 128
-learning rate: 1e-4
-modulation scale: 0.25
-score alpha: 0.5
-modulation regularization: 0.02
-epochs: 100
-```
-
-FiLM is trained while the base query/document encoder remains frozen. Report
-both the mixed score and FiLM-only score against the frozen baseline.
-
-Do not tune hyperparameters against test NDCG. Use development data or fixed
-training-only validation splits, then lock the configuration across models and
-datasets.
+That is much more defensible than claiming that a pooled zero-shot adapter transfers across unrelated BEIR domains.

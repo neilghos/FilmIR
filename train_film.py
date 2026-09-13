@@ -248,7 +248,11 @@ def train_conditioner(
     device,
 ):
     query_tensor = torch.from_numpy(np.asarray(query_embeddings, dtype=np.float32))
-    document_tensor = torch.from_numpy(np.asarray(document_embeddings, dtype=np.float32))
+    # Cached corpora may be read-only memmaps.  Make an owned tensor rather
+    # than exposing a non-writable NumPy buffer to PyTorch.
+    document_tensor = torch.from_numpy(
+        np.asarray(document_embeddings, dtype=np.float32).copy()
+    )
     dataset = CandidateDataset(
         [example[0] for example in examples],
         [example[1] for example in examples],
@@ -297,7 +301,11 @@ def film_retrieve(
     score_alpha=0.1,
 ):
     conditioner.eval()
-    documents = torch.from_numpy(np.asarray(document_embeddings, dtype=np.float32)).to(device)
+    # Cached corpora may be read-only memmaps; own the array before converting
+    # it to a tensor so PyTorch never receives a non-writable NumPy buffer.
+    documents = torch.from_numpy(
+        np.asarray(document_embeddings, dtype=np.float32).copy()
+    ).to(device)
     queries = torch.from_numpy(np.asarray(query_embeddings, dtype=np.float32))
     results = {}
     with torch.no_grad():

@@ -29,6 +29,8 @@ DATASETS = {
     "scidocs": 25_657,
     "fiqa": 57_638,
     "fever": 5_416_568,
+    "msmarco": 8_841_823,
+    "hotpotqa": 5_233_329,
 }
 
 MODELS = {
