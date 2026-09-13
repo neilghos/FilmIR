@@ -15,9 +15,13 @@ class FiLMConditioner(nn.Module):
         embedding_dim: int,
         hidden_dim: int = 256,
         modulation_scale: float = 0.1,
+        parameterization: str = "rectangular",
     ) -> None:
         super().__init__()
         self.modulation_scale = modulation_scale
+        if parameterization not in {"rectangular", "polar"}:
+            raise ValueError(f"Unknown FiLM parameterization: {parameterization}")
+        self.parameterization = parameterization
         self.network = nn.Sequential(
             nn.Linear(embedding_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -29,11 +33,18 @@ class FiLMConditioner(nn.Module):
         nn.init.zeros_(self.network[-1].bias)
 
     def forward(self, query_embeddings: torch.Tensor):
-        raw_gamma_delta, raw_beta = self.network(query_embeddings).chunk(2, dim=-1)
-        # Keep the learned space close to the frozen baseline.  The tanh bound
-        # prevents a query from arbitrarily flipping or translating dimensions.
-        gamma_delta = self.modulation_scale * torch.tanh(raw_gamma_delta)
-        beta = self.modulation_scale * torch.tanh(raw_beta)
+        raw_first, raw_second = self.network(query_embeddings).chunk(2, dim=-1)
+        if self.parameterization == "polar":
+            # The modulation vector (gamma - 1, beta) lies inside a disk.
+            # Zero-initialized outputs give radius=0, hence the exact baseline.
+            radius = self.modulation_scale * torch.tanh(raw_first)
+            gamma_delta = radius * torch.cos(raw_second)
+            beta = radius * torch.sin(raw_second)
+        else:
+            # Keep the learned space close to the frozen baseline.  The tanh
+            # bound prevents a query from arbitrarily changing dimensions.
+            gamma_delta = self.modulation_scale * torch.tanh(raw_first)
+            beta = self.modulation_scale * torch.tanh(raw_second)
         return 1.0 + gamma_delta, beta
 
     def regularization_loss(self, query_embeddings: torch.Tensor) -> torch.Tensor:

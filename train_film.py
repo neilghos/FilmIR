@@ -52,26 +52,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-split", default="test")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--hard-negatives", type=int, default=31)
     parser.add_argument("--random-negatives", type=int, default=32)
     parser.add_argument("--top-k", type=int, default=1000)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
-    parser.add_argument("--hidden-dim", type=int, default=256)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument(
+        "--film-parameterization",
+        choices=("rectangular", "polar"),
+        default="polar",
+        help="Bound FiLM modulation directly or in polar coordinates.",
+    )
     parser.add_argument(
         "--modulation-scale",
         type=float,
-        default=0.1,
+        default=0.25,
         help="Maximum absolute FiLM delta/beta before score mixing.",
     )
     parser.add_argument(
         "--score-alpha",
         type=float,
-        default=0.1,
+        default=0.5,
         help="Weight of the FiLM score correction; 0 is the baseline.",
     )
-    parser.add_argument("--modulation-regularization", type=float, default=0.01)
+    parser.add_argument("--modulation-regularization", type=float, default=0.02)
     parser.add_argument("--model-batch-size", type=int, default=64)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=13)
@@ -247,6 +253,7 @@ def train_conditioner(
         embedding_dim,
         args.hidden_dim,
         modulation_scale=args.modulation_scale,
+        parameterization=args.film_parameterization,
     ).to(device)
     optimizer = torch.optim.AdamW(conditioner.parameters(), lr=args.learning_rate)
 
@@ -262,7 +269,8 @@ def train_conditioner(
             scores = base_scores + args.score_alpha * (film_scores - base_scores)
             positive_scores = scores[:, :1]
             negative_scores = scores[:, 1:]
-            bpr_loss = -F.logsigmoid(positive_scores - negative_scores).mean()
+            margins = positive_scores - negative_scores
+            bpr_loss = -F.logsigmoid(margins).mean()
             regularization = conditioner.regularization_loss(queries)
             loss = bpr_loss + args.modulation_regularization * regularization
             optimizer.zero_grad()
@@ -435,6 +443,7 @@ def main():
                 "fold": args.fold if cross_validate else None,
                 "score_alpha": args.score_alpha,
                 "modulation_scale": args.modulation_scale,
+                "film_parameterization": args.film_parameterization,
                 "modulation_regularization": args.modulation_regularization,
             }
             result_dir = output_root / dataset_name / model_key
@@ -447,6 +456,7 @@ def main():
                     "train_split": train_split,
                     "fold": args.fold if cross_validate else None,
                     "modulation_scale": args.modulation_scale,
+                    "film_parameterization": args.film_parameterization,
                     "score_alpha": args.score_alpha,
                 },
                 result_dir / "film.pt",

@@ -36,11 +36,15 @@ python run_beir_baselines.py --datasets nfcorpus --models minilm
 python train_film.py --datasets nfcorpus --models minilm --epochs 5
 ```
 
-The trainer uses bounded FiLM residuals and a BPR objective. Its final score is
-the baseline score plus a small FiLM correction. Each
+The trainer uses bounded FiLM residuals and a BPR objective. Its final score
+is the baseline score plus a small FiLM correction. Each
 `runs/beir_film/<dataset>/<model>/metrics.json` contains `baseline`,
 `film_mixed`, and `film_only` metrics. The matching run files contain the
 top-1000 rankings.
+
+Use `--film-parameterization polar` to test the bounded polar variant, which
+constrains `(gamma - 1, beta)` to lie inside a disk while preserving the
+identity initialization.
 
 The first hypothesis test is:
 
