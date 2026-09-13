@@ -1,3 +1,0 @@
-# Optional dependencies for the KG/STaRK pipeline.  This is intentionally
-# separate from requirements-baseline.txt and the pure BEIR IR experiments.
-stark-qa>=1.1.0
