@@ -1,4 +1,4 @@
-"""Evaluate pretrained dense retrieval baselines on four small BEIR datasets.
+"""Evaluate pretrained dense retrieval baselines on configured BEIR datasets.
 
 The cached embeddings are the input to the later FiLM experiment.  This
 script intentionally does not train a retriever: it evaluates frozen
@@ -16,34 +16,60 @@ from typing import Iterable
 import numpy as np
 
 
-# Smallest BEIR corpora by corpus size in the standard 18-dataset release.
+# Bump this whenever the text serialization or encoder pooling changes.  It
+# prevents stale embeddings from silently contaminating comparisons.
+CACHE_VERSION = "v5_beir_reference"
+
+
+# BEIR corpora currently used by the baseline and FiLM pipelines.
 DATASETS = {
     "nfcorpus": 3_633,
     "scifact": 5_183,
     "arguana": 8_674,
     "scidocs": 25_657,
+    "fiqa": 57_638,
+    "fever": 5_416_568,
 }
 
 MODELS = {
     "minilm": {
+        "kind": "sentence_transformer",
         "name": "sentence-transformers/all-MiniLM-L6-v2",
         "query_prefix": "",
         "document_prefix": "",
     },
     "multiqa": {
+        "kind": "sentence_transformer",
         "name": "sentence-transformers/multi-qa-MiniLM-L6-cos-v1",
         "query_prefix": "",
         "document_prefix": "",
     },
     "bge": {
+        "kind": "sentence_transformer",
         "name": "BAAI/bge-base-en-v1.5",
         "query_prefix": "Represent this sentence for searching relevant passages: ",
         "document_prefix": "",
     },
     "e5": {
+        "kind": "sentence_transformer",
         "name": "intfloat/e5-base-v2",
         "query_prefix": "query: ",
         "document_prefix": "passage: ",
+    },
+    "contriever": {
+        "kind": "hf_shared",
+        "name": "facebook/contriever",
+        "query_prefix": "",
+        "document_prefix": "",
+    },
+    "dpr": {
+        "kind": "dpr",
+        # This is the multi-dataset DPR pair used by the original BEIR
+        # reference evaluator, not the weaker NQ-only single-nq pair.
+        "name": "facebook/dpr-question_encoder-multiset-base",
+        "document_name": "facebook/dpr-ctx_encoder-multiset-base",
+        "query_prefix": "",
+        "document_prefix": "",
     },
 }
 
@@ -91,7 +117,8 @@ def download_dataset(dataset: str, root: Path, force: bool = False) -> Path:
 def entity_text(row: dict) -> str:
     title = row.get("title") or ""
     text = row.get("text") or ""
-    return f"{title}. {text}".strip()
+    # Match BEIR's corpus serialization: title, one space, then text.
+    return f"{title} {text}".strip()
 
 
 def encode(
@@ -99,8 +126,45 @@ def encode(
     texts: Iterable[str],
     prefix: str,
     batch_size: int,
+    side: str = "document",
 ) -> np.ndarray:
-    values = [prefix + text for text in texts]
+    items = list(texts)
+    if side == "document" and items and isinstance(items[0], dict):
+        if hasattr(model, "encode_corpus"):
+            embeddings = model.encode_corpus(
+                items,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+            )
+            if hasattr(embeddings, "detach"):
+                embeddings = embeddings.detach().cpu().numpy()
+            return np.asarray(embeddings, dtype=np.float32)
+        values = [prefix + entity_text(item) for item in items]
+    else:
+        values = [prefix + text for text in items]
+    if hasattr(model, "encode_side"):
+        return model.encode_side(values, side=side, batch_size=batch_size)
+    if side == "query" and hasattr(model, "encode_queries"):
+        embeddings = model.encode_queries(
+            values,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+        if hasattr(embeddings, "detach"):
+            embeddings = embeddings.detach().cpu().numpy()
+        return np.asarray(embeddings, dtype=np.float32)
+    if side == "document" and hasattr(model, "encode_corpus"):
+        embeddings = model.encode_corpus(
+            values,
+            batch_size=batch_size,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+        )
+        if hasattr(embeddings, "detach"):
+            embeddings = embeddings.detach().cpu().numpy()
+        return np.asarray(embeddings, dtype=np.float32)
     embeddings = model.encode(
         values,
         batch_size=batch_size,
@@ -109,6 +173,143 @@ def encode(
         normalize_embeddings=True,
     )
     return np.asarray(embeddings, dtype=np.float32)
+
+
+class HFTextEncoder:
+    """Small adapter for Hugging Face encoders not packaged as SentenceTransformers."""
+
+    def __init__(self, model_name: str, device: str, model_kind: str, document_name: str | None = None):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        self.device = torch.device(device)
+        self.model_kind = model_kind
+        self.models = {}
+        self.tokenizers = {}
+        if model_kind == "contriever":
+            self.models["query"] = AutoModel.from_pretrained(model_name).to(self.device).eval()
+            self.tokenizers["query"] = AutoTokenizer.from_pretrained(model_name)
+            self.models["document"] = self.models["query"]
+            self.tokenizers["document"] = self.tokenizers["query"]
+        elif model_kind == "dpr":
+            from transformers import (
+                DPRContextEncoder,
+                DPRContextEncoderTokenizerFast,
+                DPRQuestionEncoder,
+                DPRQuestionEncoderTokenizerFast,
+            )
+
+            if document_name is None:
+                raise ValueError("DPR requires a context encoder checkpoint")
+            self.models["query"] = DPRQuestionEncoder.from_pretrained(model_name).to(self.device).eval()
+            self.tokenizers["query"] = DPRQuestionEncoderTokenizerFast.from_pretrained(model_name)
+            self.models["document"] = DPRContextEncoder.from_pretrained(document_name).to(self.device).eval()
+            self.tokenizers["document"] = DPRContextEncoderTokenizerFast.from_pretrained(document_name)
+        else:
+            raise ValueError(f"Unsupported Hugging Face encoder kind: {model_kind}")
+
+    def encode_side(self, texts: list[str], side: str, batch_size: int) -> np.ndarray:
+        import torch
+
+        if side not in self.models:
+            raise ValueError(f"Unsupported encoding side: {side}")
+        model = self.models[side]
+        tokenizer = self.tokenizers[side]
+        batches = []
+        with torch.no_grad():
+            for start in range(0, len(texts), batch_size):
+                tokens = tokenizer(
+                    texts[start : start + batch_size],
+                    padding=True,
+                    truncation=True,
+                    max_length=512,
+                    return_tensors="pt",
+                )
+                tokens = {key: value.to(self.device) for key, value in tokens.items()}
+                outputs = model(**tokens)
+                # Contriever is trained/evaluated with mean pooling over the
+                # masked token states.  AutoModel may expose a pooler_output
+                # for its BERT backbone, but using that CLS vector collapses
+                # Contriever's BEIR performance.  DPR, in contrast, defines
+                # its representation as pooler_output.
+                if self.model_kind == "contriever":
+                    hidden = outputs.last_hidden_state
+                    mask = tokens["attention_mask"].unsqueeze(-1).to(hidden.dtype)
+                    embedding = (hidden * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+                    embedding = torch.nn.functional.normalize(embedding, dim=-1)
+                else:
+                    embedding = outputs.pooler_output
+                batches.append(embedding.cpu().numpy().astype(np.float32))
+        if not batches:
+            return np.empty((0, model.config.hidden_size), dtype=np.float32)
+        return np.concatenate(batches, axis=0)
+
+    def encode_corpus(self, corpus: list[dict], batch_size: int, **kwargs) -> np.ndarray:
+        """Encode DPR documents using the official title/text tokenizer pair."""
+        if self.model_kind != "dpr":
+            return self.encode_side([entity_text(row) for row in corpus], "document", batch_size)
+
+        import torch
+
+        model = self.models["document"]
+        tokenizer = self.tokenizers["document"]
+        titles = [row.get("title") or "" for row in corpus]
+        texts = [row.get("text") or "" for row in corpus]
+        batches = []
+        with torch.no_grad():
+            for start in range(0, len(corpus), batch_size):
+                tokens = tokenizer(
+                    titles[start : start + batch_size],
+                    texts[start : start + batch_size],
+                    padding=True,
+                    truncation="longest_first",
+                    max_length=512,
+                    return_tensors="pt",
+                )
+                tokens = {key: value.to(self.device) for key, value in tokens.items()}
+                # Match BEIR's historical DPR wrapper exactly: it forwards
+                # only input_ids and attention_mask, omitting token_type_ids.
+                embedding = model(
+                    input_ids=tokens["input_ids"],
+                    attention_mask=tokens["attention_mask"],
+                ).pooler_output
+                batches.append(embedding.cpu().numpy().astype(np.float32))
+        if not batches:
+            return np.empty((0, model.config.hidden_size), dtype=np.float32)
+        return np.concatenate(batches, axis=0)
+
+
+def load_encoder(model_key: str, device: str | None = None):
+    spec = MODELS[model_key]
+    kind = spec["kind"]
+    if kind == "sentence_transformer":
+        from sentence_transformers import SentenceTransformer
+
+        return SentenceTransformer(spec["name"], device=device)
+    if kind == "hf_shared":
+        # Use BEIR's own Hugging Face wrapper for Contriever.  It implements
+        # the reference mean-pooling and normalization path.
+        from beir.retrieval.models import HuggingFace
+
+        return HuggingFace(
+            model_path=spec["name"],
+            sep=" ",
+            pooling="mean",
+            # The original Contriever BEIR script defaults to raw dot-product
+            # embeddings; normalization is opt-in there.
+            normalize=False,
+            max_length=512,
+            prompts={"query": "", "passage": ""},
+        )
+    resolved_device = device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
+    if kind == "dpr":
+        return HFTextEncoder(
+            spec["name"],
+            resolved_device,
+            "dpr",
+            document_name=spec["document_name"],
+        )
+    raise ValueError(f"Unknown model kind: {kind}")
 
 
 def retrieve(
@@ -158,7 +359,6 @@ def main() -> None:
 
     try:
         from beir.datasets.data_loader import GenericDataLoader
-        from sentence_transformers import SentenceTransformer
     except ImportError as exc:
         raise RuntimeError(
             "Install dependencies first: pip install -r requirements-baseline.txt"
@@ -172,7 +372,7 @@ def main() -> None:
 
         document_ids = list(corpus)
         query_ids = list(queries)
-        document_texts = [entity_text(corpus[doc_id]) for doc_id in document_ids]
+        document_rows = [corpus[doc_id] for doc_id in document_ids]
         query_texts = [queries[query_id] for query_id in query_ids]
         print(
             f"{dataset_name}: {len(document_ids):,} documents, "
@@ -181,7 +381,7 @@ def main() -> None:
 
         for model_key in args.models:
             spec = MODELS[model_key]
-            model_cache = cache_root / dataset_name / model_key
+            model_cache = cache_root / CACHE_VERSION / dataset_name / model_key
             model_cache.mkdir(parents=True, exist_ok=True)
             corpus_path = model_cache / "corpus.npy"
             queries_path = model_cache / "queries.npy"
@@ -198,20 +398,24 @@ def main() -> None:
                 query_embeddings = np.load(queries_path)
             else:
                 print(f"Encoding {dataset_name} with {spec['name']}")
-                model = SentenceTransformer(spec["name"], device=args.device)
+                model = load_encoder(model_key, args.device)
                 document_embeddings = encode(
                     model,
-                    document_texts,
+                    document_rows,
                     spec["document_prefix"],
                     args.batch_size,
+                    side="document",
                 )
                 query_embeddings = encode(
                     model,
                     query_texts,
                     spec["query_prefix"],
                     args.batch_size,
+                    side="query",
                 )
-                np.save(corpus_path, document_embeddings.astype(np.float16))
+                # Keep reference embeddings in float32.  Float16 is useful for
+                # large experiments but can change close retrieval ties.
+                np.save(corpus_path, document_embeddings.astype(np.float32))
                 np.save(queries_path, query_embeddings.astype(np.float32))
                 with ids_path.open("w", encoding="utf-8") as handle:
                     json.dump(

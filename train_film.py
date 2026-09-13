@@ -19,12 +19,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from film import FiLMConditioner
 from run_beir_baselines import (
+    CACHE_VERSION,
     DATASETS,
     MODELS,
     download_dataset,
     encode,
-    entity_text,
     evaluate,
+    load_encoder,
     retrieve,
 )
 
@@ -56,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--hard-negatives", type=int, default=31)
     parser.add_argument("--random-negatives", type=int, default=32)
-    parser.add_argument("--top-k", type=int, default=1000)
+    parser.add_argument("--top-k", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument(
@@ -99,7 +100,7 @@ def load_or_encode_queries(
     model,
     batch_size: int,
 ):
-    cache_dir = cache_root / dataset_name / model_key
+    cache_dir = cache_root / CACHE_VERSION / dataset_name / model_key
     query_path = cache_dir / f"queries-{split}.npy"
     ids_path = cache_dir / f"query-ids-{split}.json"
     if query_path.exists() and ids_path.exists():
@@ -127,6 +128,7 @@ def load_or_encode_queries(
         [queries[query_id] for query_id in query_ids],
         spec["query_prefix"],
         batch_size,
+        side="query",
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
     np.save(query_path, embeddings)
@@ -143,7 +145,7 @@ def load_or_encode_corpus(
     model,
     batch_size: int,
 ):
-    cache_dir = cache_root / dataset_name / model_key
+    cache_dir = cache_root / CACHE_VERSION / dataset_name / model_key
     embedding_path = cache_dir / "corpus.npy"
     ids_path = cache_dir / "ids.json"
     corpus, _, _ = load_beir_split(dataset_dir, "test")
@@ -158,12 +160,15 @@ def load_or_encode_corpus(
     spec = MODELS[model_key]
     embeddings = encode(
         model,
-        [entity_text(corpus[document_id]) for document_id in document_ids],
+        [corpus[document_id] for document_id in document_ids],
         spec["document_prefix"],
         batch_size,
+        side="document",
     )
     cache_dir.mkdir(parents=True, exist_ok=True)
-    np.save(embedding_path, embeddings.astype(np.float16))
+    # Keep the frozen base representation in float32 so the baseline and
+    # FiLM scores use the same numerical values as the BEIR reference path.
+    np.save(embedding_path, embeddings.astype(np.float32))
     with ids_path.open("w", encoding="utf-8") as handle:
         json.dump({"document_ids": document_ids}, handle)
     return np.load(embedding_path, mmap_mode="r"), document_ids
@@ -319,8 +324,6 @@ def main():
     cache_root = Path(args.cache_dir)
     output_root = Path(args.output_dir)
 
-    from sentence_transformers import SentenceTransformer
-
     for dataset_name in args.datasets:
         dataset_dir = download_dataset(dataset_name, Path(args.data_dir))
         train_split, cross_validate = choose_protocol(dataset_dir, args.train_split)
@@ -340,7 +343,7 @@ def main():
 
         for model_key in args.models:
             spec = MODELS[model_key]
-            model = SentenceTransformer(spec["name"], device=device)
+            model = load_encoder(model_key, device)
             documents, document_ids = load_or_encode_corpus(
                 dataset_name,
                 dataset_dir,

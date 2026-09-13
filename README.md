@@ -2,8 +2,9 @@
 
 ## BEIR dense baselines
 
-Run the first-stage baseline sweep on the four smallest standard BEIR
-corpora: NFCorpus, SciFact, ArguAna, and SciDocs.
+Run the first-stage baseline sweep on the configured standard BEIR corpora.
+The dense backbones currently include MiniLM, MultiQA, BGE, E5, Contriever,
+and DPR.
 
 ```bash
 python -m pip install -r requirements-baseline.txt
@@ -34,6 +35,15 @@ Start with one small smoke test:
 ```bash
 python run_beir_baselines.py --datasets nfcorpus --models minilm
 python train_film.py --datasets nfcorpus --models minilm --epochs 5
+```
+
+Contriever and DPR use Hugging Face encoders. DPR encodes queries and
+documents with its separate question and context encoders. Both can be used
+as frozen baselines and as FiLM backbones:
+
+```bash
+python run_beir_baselines.py --datasets nfcorpus --models contriever dpr
+python train_film.py --datasets nfcorpus --models contriever dpr
 ```
 
 The trainer uses bounded FiLM residuals and a BPR objective. Its final score
