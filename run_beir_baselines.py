@@ -8,10 +8,11 @@ query/document encoders and writes their embeddings and retrieval runs.
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 import numpy as np
 
@@ -28,9 +29,25 @@ DATASETS = {
     "arguana": 8_674,
     "scidocs": 25_657,
     "fiqa": 57_638,
+    "trec-covid": 171_332,
+    "webis-touche2020": 382_545,
+    "dbpedia-entity": 4_635_922,
+    "climate-fever": 5_416_593,
     "fever": 5_416_568,
-    "msmarco": 8_841_823,
     "hotpotqa": 5_233_329,
+}
+
+STREAMING_DATASETS = {
+    "trec-covid",
+    "webis-touche2020",
+    "dbpedia-entity",
+    "climate-fever",
+    "fever",
+    "hotpotqa",
+}
+
+DOWNLOAD_ARCHIVES = {
+    "trec-covid": "trec-covid-beir",
 }
 
 MODELS = {
@@ -85,6 +102,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--models", nargs="+", choices=list(MODELS), default=list(MODELS))
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--top-k", type=int, default=1000)
+    parser.add_argument(
+        "--corpus-chunk-size",
+        type=int,
+        default=65536,
+        help="Streaming corpus rows per encoding chunk for large datasets.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--force-encode", action="store_true")
@@ -103,17 +126,33 @@ def download_dataset(dataset: str, root: Path, force: bool = False) -> Path:
             "Install dependencies first: pip install -r requirements-baseline.txt"
         ) from exc
 
+    archive = DOWNLOAD_ARCHIVES.get(dataset, dataset)
     dataset_dir = root / dataset
-    if force and dataset_dir.exists():
+    archive_dir = root / archive
+    if force:
         import shutil
 
-        shutil.rmtree(dataset_dir)
+        for candidate in {dataset_dir, archive_dir}:
+            if candidate.exists() and candidate != root:
+                shutil.rmtree(candidate)
+    if dataset_dir.exists():
+        return dataset_dir
+    # Some official archives, notably TREC-COVID, extract into a directory
+    # named after the archive rather than the BEIR dataset key.
+    if archive_dir.exists():
+        return archive_dir
     if not dataset_dir.exists():
         root.mkdir(parents=True, exist_ok=True)
-        url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{dataset}.zip"
+        url = f"https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/{archive}.zip"
         print(f"Downloading {dataset} from {url}")
         util.download_and_unzip(url, str(root))
-    return dataset_dir
+    if dataset_dir.exists():
+        return dataset_dir
+    if archive_dir.exists():
+        return archive_dir
+    raise FileNotFoundError(
+        f"Downloaded {dataset}, but neither {dataset_dir} nor {archive_dir} exists"
+    )
 
 
 def entity_text(row: dict) -> str:
@@ -175,6 +214,107 @@ def encode(
         normalize_embeddings=True,
     )
     return np.asarray(embeddings, dtype=np.float32)
+
+
+def load_beir_split_metadata(dataset_dir: Path, split: str):
+    """Load BEIR queries/qrels without materializing the corpus."""
+    query_file = dataset_dir / "queries.jsonl"
+    qrels_file = dataset_dir / "qrels" / f"{split}.tsv"
+    if not query_file.exists() or not qrels_file.exists():
+        raise FileNotFoundError(f"Missing BEIR {split} metadata in {dataset_dir}")
+
+    qrels: dict[str, dict[str, int]] = defaultdict(dict)
+    with qrels_file.open("r", encoding="utf-8") as handle:
+        next(handle, None)
+        for line in handle:
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) == 3:
+                query_id, document_id, score = fields
+            elif len(fields) == 4:
+                query_id, _, document_id, score = fields
+            else:
+                raise ValueError(f"Unexpected qrels row in {qrels_file}: {line!r}")
+            qrels[query_id][document_id] = int(score)
+
+    queries: dict[str, str] = {}
+    with query_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            query_id = str(row["_id"])
+            if query_id in qrels:
+                queries[query_id] = row.get("text") or ""
+    query_ids = [query_id for query_id in qrels if query_id in queries]
+    return queries, dict(qrels), query_ids
+
+
+def iter_corpus_rows(corpus_file: Path) -> Iterator[dict]:
+    """Stream corpus rows so large BEIR collections never enter a Python dict."""
+    with corpus_file.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            yield json.loads(line)
+
+
+def corpus_line_count(corpus_file: Path) -> int:
+    with corpus_file.open("rb") as handle:
+        return sum(1 for _ in handle)
+
+
+def encode_corpus_streaming(
+    model,
+    corpus_file: Path,
+    output_path: Path,
+    ids_path: Path,
+    prefix: str,
+    batch_size: int,
+    chunk_size: int = 8192,
+) -> tuple[np.ndarray, list[str]]:
+    """Encode a JSONL corpus into a disk-backed NumPy array in bounded chunks."""
+    document_count = corpus_line_count(corpus_file)
+    document_ids: list[str] = []
+    embeddings = None
+    offset = 0
+    rows: list[dict] = []
+
+    for row in iter_corpus_rows(corpus_file):
+        rows.append(row)
+        if len(rows) < chunk_size:
+            continue
+        chunk_embeddings = encode(model, rows, prefix, batch_size, side="document")
+        if embeddings is None:
+            embeddings = np.lib.format.open_memmap(
+                output_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(document_count, chunk_embeddings.shape[1]),
+            )
+        end = offset + len(rows)
+        embeddings[offset:end] = chunk_embeddings
+        document_ids.extend(str(item["_id"]) for item in rows)
+        offset = end
+        rows = []
+
+    if rows:
+        chunk_embeddings = encode(model, rows, prefix, batch_size, side="document")
+        if embeddings is None:
+            embeddings = np.lib.format.open_memmap(
+                output_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(document_count, chunk_embeddings.shape[1]),
+            )
+        end = offset + len(rows)
+        embeddings[offset:end] = chunk_embeddings
+        document_ids.extend(str(item["_id"]) for item in rows)
+        offset = end
+
+    if embeddings is None or offset != document_count:
+        raise RuntimeError(
+            f"Streaming corpus count mismatch: encoded {offset}, expected {document_count}"
+        )
+    embeddings.flush()
+    with ids_path.open("w", encoding="utf-8") as handle:
+        json.dump({"document_ids": document_ids}, handle)
+    return np.load(output_path, mmap_mode="r"), document_ids
 
 
 class HFTextEncoder:
@@ -320,17 +460,40 @@ def retrieve(
     query_ids: list[str],
     document_ids: list[str],
     top_k: int,
+    document_chunk_size: int = 262_144,
+    query_chunk_size: int = 64,
 ) -> dict[str, dict[str, float]]:
+    """Exact top-k retrieval while scanning a memmap once in document chunks."""
     top_k = min(top_k, len(document_ids))
     results: dict[str, dict[str, float]] = {}
-    for query_id, query_embedding in zip(query_ids, query_embeddings):
-        scores = np.asarray(document_embeddings, dtype=np.float32) @ query_embedding
-        candidate_indices = np.argpartition(-scores, top_k - 1)[:top_k]
-        candidate_indices = candidate_indices[np.argsort(-scores[candidate_indices])]
-        results[query_id] = {
-            document_ids[int(index)]: float(scores[int(index)])
-            for index in candidate_indices
-        }
+    for query_start in range(0, len(query_ids), query_chunk_size):
+        query_end = min(query_start + query_chunk_size, len(query_ids))
+        query_batch = np.asarray(query_embeddings[query_start:query_end], dtype=np.float32)
+        query_count = query_end - query_start
+        best_scores = np.full((query_count, top_k), -np.inf, dtype=np.float32)
+        best_ids = np.full((query_count, top_k), "", dtype=object)
+
+        for start in range(0, len(document_ids), document_chunk_size):
+            end = min(start + document_chunk_size, len(document_ids))
+            document_chunk = np.asarray(document_embeddings[start:end], dtype=np.float32)
+            scores = query_batch @ document_chunk.T
+            local_k = min(top_k, end - start)
+            local_indices = np.argpartition(-scores, local_k - 1, axis=1)[:, :local_k]
+            local_scores = np.take_along_axis(scores, local_indices, axis=1)
+            local_ids = np.asarray(document_ids[start:end], dtype=object)[local_indices]
+
+            merged_scores = np.concatenate((best_scores, local_scores), axis=1)
+            merged_ids = np.concatenate((best_ids, local_ids), axis=1)
+            keep = np.argpartition(-merged_scores, top_k - 1, axis=1)[:, :top_k]
+            best_scores = np.take_along_axis(merged_scores, keep, axis=1)
+            best_ids = np.take_along_axis(merged_ids, keep, axis=1)
+
+        for row, query_id in enumerate(query_ids[query_start:query_end]):
+            order = np.argsort(-best_scores[row])
+            results[query_id] = {
+                str(best_ids[row, index]): float(best_scores[row, index])
+                for index in order
+            }
     return results
 
 
@@ -368,16 +531,25 @@ def main() -> None:
 
     for dataset_name in args.datasets:
         dataset_dir = download_dataset(dataset_name, data_root, args.force_download)
-        corpus, queries, qrels = GenericDataLoader(
-            data_folder=str(dataset_dir)
-        ).load(split="test")
-
-        document_ids = list(corpus)
-        query_ids = list(queries)
-        document_rows = [corpus[doc_id] for doc_id in document_ids]
+        streaming_corpus = dataset_name in STREAMING_DATASETS
+        if streaming_corpus:
+            # GenericDataLoader is convenient for small BEIR sets but loads
+            # multi-million-document corpora into a Python dictionary. Keep
+            # only the test queries/qrels in memory and stream corpus.jsonl.
+            queries, qrels, query_ids = load_beir_split_metadata(dataset_dir, "test")
+            document_ids = None
+            document_rows = None
+        else:
+            corpus, queries, qrels = GenericDataLoader(
+                data_folder=str(dataset_dir)
+            ).load(split="test")
+            document_ids = list(corpus)
+            query_ids = list(queries)
+            document_rows = [corpus[doc_id] for doc_id in document_ids]
         query_texts = [queries[query_id] for query_id in query_ids]
         print(
-            f"{dataset_name}: {len(document_ids):,} documents, "
+            f"{dataset_name}: "
+            f"{corpus_line_count(dataset_dir / 'corpus.jsonl') if streaming_corpus else len(document_ids):,} documents, "
             f"{len(query_ids):,} test queries"
         )
 
@@ -398,16 +570,31 @@ def main() -> None:
                 print(f"Loading cached embeddings: {dataset_name}/{model_key}")
                 document_embeddings = np.load(corpus_path, mmap_mode="r")
                 query_embeddings = np.load(queries_path)
+                with ids_path.open("r", encoding="utf-8") as handle:
+                    cached_ids = json.load(handle)
+                document_ids = cached_ids["document_ids"]
+                query_ids = cached_ids["query_ids"]
             else:
                 print(f"Encoding {dataset_name} with {spec['name']}")
                 model = load_encoder(model_key, args.device)
-                document_embeddings = encode(
-                    model,
-                    document_rows,
-                    spec["document_prefix"],
-                    args.batch_size,
-                    side="document",
-                )
+                if streaming_corpus:
+                    document_embeddings, document_ids = encode_corpus_streaming(
+                        model,
+                        dataset_dir / "corpus.jsonl",
+                        corpus_path,
+                        ids_path,
+                        spec["document_prefix"],
+                        args.batch_size,
+                        chunk_size=args.corpus_chunk_size,
+                    )
+                else:
+                    document_embeddings = encode(
+                        model,
+                        document_rows,
+                        spec["document_prefix"],
+                        args.batch_size,
+                        side="document",
+                    )
                 query_embeddings = encode(
                     model,
                     query_texts,
@@ -417,7 +604,8 @@ def main() -> None:
                 )
                 # Keep reference embeddings in float32.  Float16 is useful for
                 # large experiments but can change close retrieval ties.
-                np.save(corpus_path, document_embeddings.astype(np.float32))
+                if not streaming_corpus:
+                    np.save(corpus_path, document_embeddings.astype(np.float32))
                 np.save(queries_path, query_embeddings.astype(np.float32))
                 with ids_path.open("w", encoding="utf-8") as handle:
                     json.dump(

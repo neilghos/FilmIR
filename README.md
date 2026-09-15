@@ -192,69 +192,8 @@ instead of `--source-datasets ...`; its output path becomes
 listed as a zero-shot target; use leave-one-dataset-out runs when evaluating
 transfer to one of the six source domains.
 
-## Legacy DBpedia/Node2Vec path
+## KG experiments
 
-The following path is Stage 2 of the plan and is separate from the BEIR
-adapter above.
-
-### Data layout
-
-Download and unpack the BEIR `dbpedia-entity` dataset into a directory with:
-
-```text
-data/dbpedia-entity/
-  corpus.jsonl
-  queries.jsonl
-  qrels/test.tsv
-```
-
-The corpus must be the BEIR DBpedia-Entity corpus. Its entity IDs must match
-the qrels. The graph used for Node2Vec is a separate edge list; it must use
-the same entity IDs.
-
-### Run the loader check
-
-```bash
-python - <<'PY'
-from data_loader import load_dbpedia_entity
-
-data = load_dbpedia_entity("data/dbpedia-entity", split="test")
-print(data.num_entities, len(data.queries), len(data.qrels))
-print(data.entity_ids[0])
-PY
-```
-
-### Train the FiLM model
-
-`Z_matrix.pt` must have one row per corpus entity, in exactly the same order as
-`corpus.jsonl`.
-
-```bash
-python trainer.py --data-dir data/dbpedia-entity --z-matrix Z_matrix.pt \
-  --mode baseline --checkpoint baseline.pt
-
-python trainer.py --data-dir data/dbpedia-entity --z-matrix Z_matrix.pt \
-  --mode film --checkpoint film.pt
-```
-
-The default training split is `dev`; keep `test` held out until the evaluator
-is wired.  Pass `--split test` only for a deliberate smoke test.
-
-The current trainer uses the gamma-only form of FiLM because beta is a
-candidate-independent additive term under dot-product retrieval. The normal
-retrieval baseline is selected with `--mode baseline`; FiLM is selected with
-`--mode film`.
-
-### Train Node2Vec with the same entity ordering
-
-Provide a tab-separated graph edge list using the same DBpedia entity IDs as
-`corpus.jsonl`. Two-column and three-column (`head`, `relation`, `tail`) files
-are accepted:
-
-```bash
-python node2vec.py \
-  --data-dir data/dbpedia-entity \
-  --edges data/dbpedia_edges.tsv \
-  --output Z_matrix.pt \
-  --node-ids node_ids.json
-```
+The experimental KG/STaRK code is isolated under `KGstark/`. The root
+retrieval pipeline uses the frozen base retriever's query embedding directly
+as input to FiLM; it does not instantiate a separate BERT query encoder.
