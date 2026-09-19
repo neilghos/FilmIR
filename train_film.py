@@ -8,6 +8,7 @@ space rather than a newly fine-tuned retriever.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 from pathlib import Path
@@ -17,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from film import FiLMConditioner
+from film import FiLMConditioner, build_conditioner
 from run_beir_baselines import (
     CACHE_VERSION,
     DATASETS,
@@ -51,6 +52,18 @@ PROMPTAGATOR_ADAPTATION_SPLITS = {
     "hotpotqa": "dev",
 }
 
+TARGET_DATASETS = [
+    "arguana",
+    "climate-fever",
+    "dbpedia-entity",
+    "fiqa",
+    "nfcorpus",
+    "scidocs",
+    "scifact",
+    "trec-covid",
+    "webis-touche2020",
+]
+
 
 class CandidateDataset(Dataset):
     def __init__(self, query_indices, candidate_indices):
@@ -69,14 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", default="data/beir")
     parser.add_argument("--cache-dir", default="runs/beir_cache")
     parser.add_argument("--output-dir", default="runs/beir_film")
-    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=list(DATASETS))
-    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=list(MODELS))
+    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=TARGET_DATASETS)
+    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=["minilm"])
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--fold", type=int, default=0)
     parser.add_argument(
         "--train-queries",
         type=int,
-        default=0,
+        default=8,
         help=(
             "Few-shot adaptation query count under the fixed Promptagator "
             "protocol. Test-only datasets exclude sampled test queries from "
@@ -90,12 +103,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-negatives", type=int, default=32)
     parser.add_argument("--top-k", type=int, default=128)
     parser.add_argument("--film-chunk-size", type=int, default=65_536)
-    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument(
         "--film-parameterization",
         choices=("rectangular", "polar"),
-        default="polar",
+        default="rectangular",
         help="Bound FiLM modulation directly or in polar coordinates.",
     )
     parser.add_argument(
@@ -107,14 +120,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--score-alpha",
         type=float,
-        default=0.5,
+        default=1.0,
         help="Weight of the FiLM score correction; 0 is the baseline.",
     )
     parser.add_argument("--modulation-regularization", type=float, default=0.02)
+    parser.add_argument(
+        "--modulator",
+        choices=("film", "lowrank"),
+        default="lowrank",
+        help="Conditioner network architecture: standard FiLM or parameter-efficient LowRank.",
+    )
+    parser.add_argument("--low-rank", type=int, default=4, help="Bottleneck rank for LowRank modulator.")
+    parser.add_argument(
+        "--loss-type",
+        choices=("bpr", "infonce"),
+        default="infonce",
+        help="Ranking loss function: pairwise BPR or Softmax Cross-Entropy InfoNCE.",
+    )
+    parser.add_argument("--temperature", type=float, default=0.05, help="Temperature for InfoNCE ranking loss.")
+    parser.add_argument(
+        "--modulation-mode",
+        choices=("full", "scale_only", "shift_only"),
+        default="full",
+        help="Components of FiLM modulation: full (gamma & beta), scale_only (gamma only), or shift_only (beta only).",
+    )
+    parser.add_argument(
+        "--use-corpus-centroid",
+        action="store_true",
+        help="Inject normalized corpus document centroid into FiLM conditioner input.",
+    )
     parser.add_argument("--model-batch-size", type=int, default=512)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
+
+
+def compute_corpus_centroid(document_embeddings: np.ndarray, chunk_size: int = 65_536) -> np.ndarray:
+    """Compute normalized corpus centroid in chunks for memory safety."""
+    num_docs, dim = document_embeddings.shape
+    total_sum = np.zeros(dim, dtype=np.float64)
+    for start in range(0, num_docs, chunk_size):
+        end = min(start + chunk_size, num_docs)
+        total_sum += np.sum(document_embeddings[start:end], axis=0, dtype=np.float64)
+    centroid = (total_sum / max(1, num_docs)).astype(np.float32)
+    norm = np.linalg.norm(centroid)
+    if norm > 1e-12:
+        centroid = centroid / norm
+    return centroid
+
 
 
 def load_beir_split(dataset_dir: Path, split: str):
@@ -290,6 +343,7 @@ def train_conditioner(
     embedding_dim,
     args,
     device,
+    corpus_centroid=None,
 ):
     query_tensor = torch.from_numpy(np.asarray(query_embeddings, dtype=np.float32))
     dataset = CandidateDataset(
@@ -297,13 +351,30 @@ def train_conditioner(
         [example[1] for example in examples],
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    conditioner = FiLMConditioner(
-        embedding_dim,
-        args.hidden_dim,
+    use_centroid = getattr(args, "use_corpus_centroid", False)
+    modulator = getattr(args, "modulator", "film")
+    low_rank = getattr(args, "low_rank", 4)
+    loss_type = getattr(args, "loss_type", "bpr")
+    temperature = getattr(args, "temperature", 0.05)
+    modulation_mode = getattr(args, "modulation_mode", "full")
+
+    conditioner = build_conditioner(
+        embedding_dim=embedding_dim,
+        hidden_dim=args.hidden_dim,
         modulation_scale=args.modulation_scale,
         parameterization=args.film_parameterization,
+        modulator=modulator,
+        low_rank=low_rank,
+        use_corpus_centroid=use_centroid,
+        modulation_mode=modulation_mode,
     ).to(device)
     optimizer = torch.optim.AdamW(conditioner.parameters(), lr=args.learning_rate)
+
+    centroid_tensor = (
+        torch.from_numpy(np.asarray(corpus_centroid, dtype=np.float32)).to(device)
+        if corpus_centroid is not None and use_centroid
+        else None
+    )
 
     for epoch in range(1, args.epochs + 1):
         conditioner.train()
@@ -316,16 +387,23 @@ def train_conditioner(
                 document_embeddings[candidate_indices.numpy()], dtype=np.float32
             )
             candidates = torch.from_numpy(candidate_array).to(device)
-            conditioned = conditioner.condition(queries, candidates)
+            conditioned = conditioner.condition(queries, candidates, corpus_centroid=centroid_tensor)
             base_scores = torch.einsum("bd,bkd->bk", queries, candidates)
             film_scores = torch.einsum("bd,bkd->bk", queries, conditioned)
             scores = base_scores + args.score_alpha * (film_scores - base_scores)
-            positive_scores = scores[:, :1]
-            negative_scores = scores[:, 1:]
-            margins = positive_scores - negative_scores
-            bpr_loss = -F.logsigmoid(margins).mean()
-            regularization = conditioner.regularization_loss(queries)
-            loss = bpr_loss + args.modulation_regularization * regularization
+
+            if loss_type == "infonce":
+                scaled_scores = scores / temperature
+                targets = torch.zeros(scores.shape[0], dtype=torch.long, device=device)
+                ranking_loss = F.cross_entropy(scaled_scores, targets)
+            else:
+                positive_scores = scores[:, :1]
+                negative_scores = scores[:, 1:]
+                margins = positive_scores - negative_scores
+                ranking_loss = -F.logsigmoid(margins).mean()
+
+            regularization = conditioner.regularization_loss(queries, corpus_centroid=centroid_tensor)
+            loss = ranking_loss + args.modulation_regularization * regularization
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -377,6 +455,7 @@ def retrieve_film_variants(
     score_alpha=0.1,
     chunk_size=65_536,
     query_chunk_size=64,
+    corpus_centroid=None,
 ):
     """Exact batched full-corpus retrieval for baseline and both FiLM scores.
 
@@ -391,6 +470,13 @@ def retrieve_film_variants(
     baseline_results = {}
     film_results = {}
     film_only_results = {}
+    use_centroid = getattr(conditioner, "use_corpus_centroid", False)
+    centroid_tensor = (
+        torch.from_numpy(np.asarray(corpus_centroid, dtype=np.float32)).to(device)
+        if corpus_centroid is not None and use_centroid
+        else None
+    )
+
     with torch.no_grad():
         for query_start in range(0, len(query_ids), query_chunk_size):
             query_end = min(query_start + query_chunk_size, len(query_ids))
@@ -412,7 +498,7 @@ def retrieve_film_variants(
             film_indices = torch.zeros(shape, dtype=torch.long, device=device)
             film_only_values = torch.full(shape, -torch.inf, device=device)
             film_only_indices = torch.zeros(shape, dtype=torch.long, device=device)
-            gamma, beta = conditioner(query_batch)
+            gamma, beta = conditioner(query_batch, corpus_centroid=centroid_tensor)
             for start in range(0, len(document_ids), effective_chunk_size):
                 end = min(start + effective_chunk_size, len(document_ids))
                 documents = torch.from_numpy(
@@ -487,6 +573,54 @@ def film_retrieve(
     return film_only_results if score_alpha == 1.0 else film_results
 
 
+def update_model_csv(csv_path: Path, model_key: str, args: argparse.Namespace, rows: list[dict]):
+    """Write concise model CSV with hyperparams header, dataset results, and running MACRO_AVERAGE."""
+    if not rows:
+        return
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    avg_b = sum(r["baseline_ndcg10"] for r in rows) / len(rows)
+    avg_m = sum(r["film_mixed_ndcg10"] for r in rows) / len(rows)
+    avg_o = sum(r["film_only_ndcg10"] for r in rows) / len(rows)
+
+    mean_row = {
+        "dataset": "MACRO_AVERAGE",
+        "baseline_ndcg10": round(avg_b, 5),
+        "film_mixed_ndcg10": round(avg_m, 5),
+        "film_only_ndcg10": round(avg_o, 5),
+        "delta_mixed": round(avg_m - avg_b, 5),
+        "delta_only": round(avg_o - avg_b, 5),
+    }
+
+    all_rows = rows + [mean_row]
+
+    header_comment = (
+        f"# Hyperparameters: model={model_key}, modulator={getattr(args, 'modulator', 'lowrank')}, "
+        f"low_rank={getattr(args, 'low_rank', 4)}, film_parameterization={args.film_parameterization}, "
+        f"loss_type={getattr(args, 'loss_type', 'infonce')}, temperature={getattr(args, 'temperature', 0.05)}, "
+        f"modulation_scale={args.modulation_scale}, score_alpha={args.score_alpha}, "
+        f"learning_rate={args.learning_rate}, epochs={args.epochs}, "
+        f"train_queries={args.train_queries}, modulation_mode={getattr(args, 'modulation_mode', 'full')}\n"
+    )
+
+    with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        handle.write(header_comment)
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "dataset",
+                "baseline_ndcg10",
+                "film_mixed_ndcg10",
+                "film_only_ndcg10",
+                "delta_mixed",
+                "delta_only",
+            ],
+        )
+        writer.writeheader()
+        writer.writerows(all_rows)
+
+
 def main():
     args = parse_args()
     random.seed(args.seed)
@@ -496,37 +630,35 @@ def main():
     cache_root = Path(args.cache_dir)
     output_root = Path(args.output_dir)
 
-    for dataset_name in args.datasets:
-        dataset_dir = download_dataset(dataset_name, Path(args.data_dir))
-        adaptation_split = PROMPTAGATOR_ADAPTATION_SPLITS[dataset_name]
-        eval_split = "test"
-        cross_validate = adaptation_split == "test"
-        test_support_ids = []
-        if adaptation_split == "test":
-            all_queries, all_qrels, all_ids = load_beir_split_metadata(dataset_dir, "test")
-            if args.train_queries > 0:
-                # Promptagator's test-only protocol: use a few test examples
-                # for adaptation, keep all test queries in the denominator,
-                # and assign the support queries zero retrieval credit below.
-                train_ids = sample_query_ids(all_ids, args.train_queries, args.seed)
-                test_support_ids = list(train_ids)
-                eval_ids = list(all_ids)
-                cross_validate = False
-            else:
-                # Preserve the original five-fold protocol for unrestricted
-                # legacy runs on datasets without train/dev splits.
-                train_ids, eval_ids = split_query_ids(
-                    all_ids, args.folds, args.fold, args.seed
-                )
-            train_qrels = all_qrels
-            eval_qrels = all_qrels
-        else:
-            _, train_qrels, train_ids = load_beir_split_metadata(dataset_dir, adaptation_split)
-            _, eval_qrels, eval_ids = load_beir_split_metadata(dataset_dir, eval_split)
-            if args.train_queries > 0 and len(train_ids) > args.train_queries:
-                train_ids = sample_query_ids(train_ids, args.train_queries, args.seed)
+    for model_key in args.models:
+        model_rows = []
+        csv_path = output_root / f"{model_key}.csv"
 
-        for model_key in args.models:
+        for dataset_name in args.datasets:
+            dataset_dir = download_dataset(dataset_name, Path(args.data_dir))
+            adaptation_split = PROMPTAGATOR_ADAPTATION_SPLITS[dataset_name]
+            eval_split = "test"
+            cross_validate = adaptation_split == "test"
+            test_support_ids = []
+            if adaptation_split == "test":
+                all_queries, all_qrels, all_ids = load_beir_split_metadata(dataset_dir, "test")
+                if args.train_queries > 0:
+                    train_ids = sample_query_ids(all_ids, args.train_queries, args.seed)
+                    test_support_ids = list(train_ids)
+                    eval_ids = list(all_ids)
+                    cross_validate = False
+                else:
+                    train_ids, eval_ids = split_query_ids(
+                        all_ids, args.folds, args.fold, args.seed
+                    )
+                train_qrels = all_qrels
+                eval_qrels = all_qrels
+            else:
+                _, train_qrels, train_ids = load_beir_split_metadata(dataset_dir, adaptation_split)
+                _, eval_qrels, eval_ids = load_beir_split_metadata(dataset_dir, eval_split)
+                if args.train_queries > 0 and len(train_ids) > args.train_queries:
+                    train_ids = sample_query_ids(train_ids, args.train_queries, args.seed)
+
             spec = MODELS[model_key]
             model = load_encoder(model_key, device)
             documents, document_ids = load_or_encode_corpus(
@@ -557,9 +689,6 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Full-corpus hard-negative mining can require billions of dot
-            # products for large BEIR corpora. Use random negatives when
-            # --hard-negatives is zero; otherwise retain hard-negative mining.
             if args.hard_negatives > 0:
                 baseline_results = retrieve(
                     train_embeddings,
@@ -584,9 +713,6 @@ def main():
             if not examples:
                 raise RuntimeError(f"No training examples found for {dataset_name}/{model_key}")
 
-            # Materialize only the documents touched by the training examples.
-            # This keeps large corpus memmaps out of the training loop and
-            # avoids repeated random disk reads for every minibatch.
             global_candidates = np.unique(
                 np.asarray(
                     [index for _, candidates in examples for index in candidates],
@@ -608,8 +734,13 @@ def main():
                 documents[global_candidates], dtype=np.float32
             )
 
+            if args.use_corpus_centroid:
+                corpus_centroid = compute_corpus_centroid(documents)
+            else:
+                corpus_centroid = None
+
             print(
-                f"{dataset_name}/{model_key}: train={len(train_ids)}, "
+                f"[{model_key}] {dataset_name}: train={len(train_ids)}, "
                 f"eval={len(eval_ids)}, examples={len(examples)}, "
                 f"candidate_documents={len(global_candidates)}"
             )
@@ -620,22 +751,7 @@ def main():
                 train_embeddings.shape[1],
                 args,
                 device,
-            )
-            result_dir = output_root / dataset_name / model_key
-            result_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model": conditioner.state_dict(),
-                    "embedding_dim": train_embeddings.shape[1],
-                    "model_name": spec["name"],
-                    "adaptation_split": adaptation_split,
-                    "train_queries": len(train_ids),
-                    "fold": args.fold if cross_validate else None,
-                    "modulation_scale": args.modulation_scale,
-                    "film_parameterization": args.film_parameterization,
-                    "score_alpha": args.score_alpha,
-                },
-                result_dir / "film.pt",
+                corpus_centroid=corpus_centroid,
             )
             eval_qrels_subset = {
                 query_id: eval_qrels[query_id]
@@ -665,73 +781,39 @@ def main():
                 device,
                 score_alpha=args.score_alpha,
                 chunk_size=args.film_chunk_size,
+                corpus_centroid=corpus_centroid,
             )
             if test_support_ids:
-                # BEIR's evaluator averages over query IDs present in the run.
-                # Empty runs therefore make these support queries explicit
-                # zero-score cases instead of silently dropping them.
                 assign_zero_credit(baseline_eval_results, test_support_ids)
                 assign_zero_credit(film_results, test_support_ids)
                 assign_zero_credit(film_only_results, test_support_ids)
             baseline_metrics = evaluate(eval_qrels_subset, baseline_eval_results)
             film_metrics = evaluate(eval_qrels_subset, film_results)
             film_only_metrics = evaluate(eval_qrels_subset, film_only_results)
-            metrics = {
-                "baseline": baseline_metrics,
-                "film_mixed": film_metrics,
-                "film_only": film_only_metrics,
+
+            b_ndcg = baseline_metrics["NDCG"].get("NDCG@10", 0.0)
+            m_ndcg = film_metrics["NDCG"].get("NDCG@10", 0.0)
+            o_ndcg = film_only_metrics["NDCG"].get("NDCG@10", 0.0)
+
+            row = {
                 "dataset": dataset_name,
-                "model": model_key,
-                "adaptation_split": adaptation_split,
-                "train_queries": len(train_ids),
-                "eval_split": eval_split,
-                "cross_validation": cross_validate,
-                "test_support_zero_credit": bool(test_support_ids),
-                "test_support_queries": len(test_support_ids),
-                "adaptation_protocol": (
-                    "few_shot_test_zero_credit"
-                    if test_support_ids
-                    else "few_shot_split"
-                    if args.train_queries > 0
-                    else "full_split_or_cross_validation"
-                ),
-                "fold": args.fold if cross_validate else None,
-                "score_alpha": args.score_alpha,
-                "modulation_scale": args.modulation_scale,
-                "film_parameterization": args.film_parameterization,
-                "modulation_regularization": args.modulation_regularization,
+                "baseline_ndcg10": round(b_ndcg, 5),
+                "film_mixed_ndcg10": round(m_ndcg, 5),
+                "film_only_ndcg10": round(o_ndcg, 5),
+                "delta_mixed": round(m_ndcg - b_ndcg, 5),
+                "delta_only": round(o_ndcg - b_ndcg, 5),
             }
-            result_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
-                    "model": conditioner.state_dict(),
-                    "embedding_dim": train_embeddings.shape[1],
-                    "model_name": spec["name"],
-                    "adaptation_split": adaptation_split,
-                    "fold": args.fold if cross_validate else None,
-                    "modulation_scale": args.modulation_scale,
-                    "film_parameterization": args.film_parameterization,
-                    "score_alpha": args.score_alpha,
-                },
-                result_dir / "film.pt",
-            )
-            with (result_dir / "metrics.json").open("w", encoding="utf-8") as handle:
-                json.dump(metrics, handle, indent=2)
-            with (result_dir / "baseline.run.json").open("w", encoding="utf-8") as handle:
-                json.dump(baseline_eval_results, handle)
-            with (result_dir / "run.json").open("w", encoding="utf-8") as handle:
-                json.dump(film_results, handle)
-            with (result_dir / "film_only.run.json").open("w", encoding="utf-8") as handle:
-                json.dump(film_only_results, handle)
+            model_rows.append(row)
+
+            update_model_csv(csv_path, model_key, args, model_rows)
+
+            running_b = sum(r["baseline_ndcg10"] for r in model_rows) / len(model_rows)
+            running_m = sum(r["film_mixed_ndcg10"] for r in model_rows) / len(model_rows)
+
             print(
-                json.dumps(
-                    {
-                        "baseline_ndcg@10": baseline_metrics["NDCG"].get("NDCG@10"),
-                        "film_mixed_ndcg@10": film_metrics["NDCG"].get("NDCG@10"),
-                        "film_only_ndcg@10": film_only_metrics["NDCG"].get("NDCG@10"),
-                    },
-                    sort_keys=True,
-                )
+                f"  [{model_key}] {dataset_name}: base={b_ndcg:.5f} | mixed={m_ndcg:.5f} ({m_ndcg-b_ndcg:+.5f}) | "
+                f"only={o_ndcg:.5f} ({o_ndcg-b_ndcg:+.5f}) | Running Mean ({len(model_rows)} datasets): "
+                f"base={running_b:.5f}, mixed={running_m:.5f} ({running_m-running_b:+.5f})\n"
             )
 
 
