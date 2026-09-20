@@ -1,0 +1,31 @@
+# Polar FiLM Configuration
+film_parameterization: polar
+modulator: lowrank
+low_rank: 4
+loss_type: infonce
+temperature: 0.05
+modulation_scale: 0.25
+score_alpha: 1.0
+learning_rate: 0.001
+epochs: 200
+train_queries: 8
+modulation_mode: full
+hard_negatives: 31
+random_negatives: 32
+output_dir: runs/beir_film
+models:
+  - minilm
+  - contriever
+  - multiqa
+  - bge
+  - gte-small
+datasets:
+  - arguana
+  - climate-fever
+  - dbpedia-entity
+  - fiqa
+  - nfcorpus
+  - scidocs
+  - scifact
+  - trec-covid
+  - webis-touche2020

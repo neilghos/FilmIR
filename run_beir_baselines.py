@@ -65,7 +65,7 @@ MODELS = {
     },
     "bge": {
         "kind": "sentence_transformer",
-        "name": "BAAI/bge-base-en-v1.5",
+        "name": "BAAI/bge-large-en-v1.5",
         "query_prefix": "Represent this sentence for searching relevant passages: ",
         "document_prefix": "",
     },

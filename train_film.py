@@ -62,7 +62,10 @@ TARGET_DATASETS = [
     "scifact",
     "trec-covid",
     "webis-touche2020",
+    "fever",
+    "hotpotqa",
 ]
+
 
 
 class CandidateDataset(Dataset):
