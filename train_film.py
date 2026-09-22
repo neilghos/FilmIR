@@ -111,19 +111,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--film-parameterization",
         choices=("rectangular", "polar"),
-        default="rectangular",
+        default="polar",
         help="Bound FiLM modulation directly or in polar coordinates.",
     )
     parser.add_argument(
         "--modulation-scale",
         type=float,
-        default=0.25,
+        default=0.15,
         help="Maximum absolute FiLM delta/beta before score mixing.",
     )
     parser.add_argument(
         "--score-alpha",
         type=float,
-        default=1.0,
+        default=0.35,
         help="Weight of the FiLM score correction; 0 is the baseline.",
     )
     parser.add_argument("--modulation-regularization", type=float, default=0.02)

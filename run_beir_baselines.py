@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterable, Iterator
 
 import numpy as np
+import torch
 
 
 # Bump this whenever the text serialization or encoder pooling changes.  It
@@ -63,13 +64,13 @@ MODELS = {
         "query_prefix": "",
         "document_prefix": "",
     },
-    "bge": {
+    "bge-base": {
         "kind": "sentence_transformer",
-        "name": "BAAI/bge-large-en-v1.5",
+        "name": "BAAI/bge-base-en-v1.5",
         "query_prefix": "Represent this sentence for searching relevant passages: ",
         "document_prefix": "",
     },
-    "e5": {
+    "e5-base": {
         "kind": "sentence_transformer",
         "name": "intfloat/e5-base-v2",
         "query_prefix": "query: ",
@@ -206,13 +207,15 @@ def encode(
         if hasattr(embeddings, "detach"):
             embeddings = embeddings.detach().cpu().numpy()
         return np.asarray(embeddings, dtype=np.float32)
-    embeddings = model.encode(
-        values,
-        batch_size=batch_size,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-    )
+    with torch.inference_mode():
+        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+            embeddings = model.encode(
+                values,
+                batch_size=batch_size,
+                show_progress_bar=True,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )
     return np.asarray(embeddings, dtype=np.float32)
 
 
@@ -292,6 +295,8 @@ def encode_corpus_streaming(
         document_ids.extend(str(item["_id"]) for item in rows)
         offset = end
         rows = []
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if rows:
         chunk_embeddings = encode(model, rows, prefix, batch_size, side="document")

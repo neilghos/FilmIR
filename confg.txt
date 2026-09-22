@@ -1,0 +1,186 @@
+contriever, minilm, multiqa
+
+class CandidateDataset(Dataset):
+    def __init__(self, query_indices, candidate_indices):
+        self.query_indices = np.asarray(query_indices, dtype=np.int64)
+        self.candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.query_indices)
+
+    def __getitem__(self, index):
+        return self.query_indices[index], self.candidate_indices[index]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data/beir")
+    parser.add_argument("--cache-dir", default="runs/beir_cache")
+    parser.add_argument("--output-dir", default="runs/beir_film")
+    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=TARGET_DATASETS)
+    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=["minilm"])
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument(
+        "--train-queries",
+        type=int,
+        default=8,
+        help=(
+            "Few-shot adaptation query count under the fixed Promptagator "
+            "protocol. Test-only datasets exclude sampled test queries from "
+            "evaluation. 0 uses the full adaptation split or legacy five-fold "
+            "protocol."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--hard-negatives", type=int, default=31)
+    parser.add_argument("--random-negatives", type=int, default=32)
+    parser.add_argument("--top-k", type=int, default=128)
+    parser.add_argument("--film-chunk-size", type=int, default=65_536)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument(
+        "--film-parameterization",
+        choices=("rectangular", "polar"),
+        default="rectangular",
+        help="Bound FiLM modulation directly or in polar coordinates.",
+    )
+    parser.add_argument(
+        "--modulation-scale",
+        type=float,
+        default=0.25,
+        help="Maximum absolute FiLM delta/beta before score mixing.",
+    )
+    parser.add_argument(
+        "--score-alpha",
+        type=float,
+        default=1.0,
+        help="Weight of the FiLM score correction; 0 is the baseline.",
+    )
+    parser.add_argument("--modulation-regularization", type=float, default=0.02)
+    parser.add_argument(
+        "--modulator",
+        choices=("film", "lowrank"),
+        default="lowrank",
+        help="Conditioner network architecture: standard FiLM or parameter-efficient LowRank.",
+    )
+    parser.add_argument("--low-rank", type=int, default=4, help="Bottleneck rank for LowRank modulator.")
+    parser.add_argument(
+        "--loss-type",
+        choices=("bpr", "infonce"),
+        default="infonce",
+        help="Ranking loss function: pairwise BPR or Softmax Cross-Entropy InfoNCE.",
+    )
+    parser.add_argument("--temperature", type=float, default=0.05, help="Temperature for InfoNCE ranking loss.")
+    parser.add_argument(
+        "--modulation-mode",
+        choices=("full", "scale_only", "shift_only"),
+        default="full",
+        help="Components of FiLM modulation: full (gamma & beta), scale_only (gamma only), or shift_only (beta only).",
+    )
+    parser.add_argument(
+        "--use-corpus-centroid",
+        action="store_true",
+        help="Inject normalized corpus document centroid into FiLM conditioner input.",
+    )
+    parser.add_argument("--model-batch-size", type=int, default=512)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--seed", type=int, default=13)
+    return parser.parse_args()
+
+
+
+
+
+e5-base
+
+
+class CandidateDataset(Dataset):
+    def __init__(self, query_indices, candidate_indices):
+        self.query_indices = np.asarray(query_indices, dtype=np.int64)
+        self.candidate_indices = np.asarray(candidate_indices, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.query_indices)
+
+    def __getitem__(self, index):
+        return self.query_indices[index], self.candidate_indices[index]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data/beir")
+    parser.add_argument("--cache-dir", default="runs/beir_cache")
+    parser.add_argument("--output-dir", default="runs/beir_film")
+    parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=TARGET_DATASETS)
+    parser.add_argument("--models", nargs="+", choices=list(MODELS), default=["minilm"])
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--fold", type=int, default=0)
+    parser.add_argument(
+        "--train-queries",
+        type=int,
+        default=8,
+        help=(
+            "Few-shot adaptation query count under the fixed Promptagator "
+            "protocol. Test-only datasets exclude sampled test queries from "
+            "evaluation. 0 uses the full adaptation split or legacy five-fold "
+            "protocol."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--hard-negatives", type=int, default=31)
+    parser.add_argument("--random-negatives", type=int, default=32)
+    parser.add_argument("--top-k", type=int, default=128)
+    parser.add_argument("--film-chunk-size", type=int, default=65_536)
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--hidden-dim", type=int, default=128)
+    parser.add_argument(
+        "--film-parameterization",
+        choices=("rectangular", "polar"),
+        default="polar",
+        help="Bound FiLM modulation directly or in polar coordinates.",
+    )
+    parser.add_argument(
+        "--modulation-scale",
+        type=float,
+        default=0.15,
+        help="Maximum absolute FiLM delta/beta before score mixing.",
+    )
+    parser.add_argument(
+        "--score-alpha",
+        type=float,
+        default=0.35,
+        help="Weight of the FiLM score correction; 0 is the baseline.",
+    )
+    parser.add_argument("--modulation-regularization", type=float, default=0.02)
+    parser.add_argument(
+        "--modulator",
+        choices=("film", "lowrank"),
+        default="lowrank",
+        help="Conditioner network architecture: standard FiLM or parameter-efficient LowRank.",
+    )
+    parser.add_argument("--low-rank", type=int, default=4, help="Bottleneck rank for LowRank modulator.")
+    parser.add_argument(
+        "--loss-type",
+        choices=("bpr", "infonce"),
+        default="infonce",
+        help="Ranking loss function: pairwise BPR or Softmax Cross-Entropy InfoNCE.",
+    )
+    parser.add_argument("--temperature", type=float, default=0.05, help="Temperature for InfoNCE ranking loss.")
+    parser.add_argument(
+        "--modulation-mode",
+        choices=("full", "scale_only", "shift_only"),
+        default="full",
+        help="Components of FiLM modulation: full (gamma & beta), scale_only (gamma only), or shift_only (beta only).",
+    )
+    parser.add_argument(
+        "--use-corpus-centroid",
+        action="store_true",
+        help="Inject normalized corpus document centroid into FiLM conditioner input.",
+    )
+    parser.add_argument("--model-batch-size", type=int, default=512)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--seed", type=int, default=13)
+    return parser.parse_args()
