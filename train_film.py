@@ -390,8 +390,15 @@ def train_conditioner(
                 document_embeddings[candidate_indices.numpy()], dtype=np.float32
             )
             candidates = torch.from_numpy(candidate_array).to(device)
+            # FiLM training uses a single normalized cosine-like score space
+            # for every encoder.  The frozen baseline is evaluated separately
+            # with the encoder's official scorer; in particular, Contriever
+            # keeps its raw dot-product baseline.  Normalizing the unmodified
+            # candidates here makes the score mixed with FiLM comparable to
+            # the normalized conditioned-document score.
+            normalized_candidates = F.normalize(candidates, dim=-1)
             conditioned = conditioner.condition(queries, candidates, corpus_centroid=centroid_tensor)
-            base_scores = torch.einsum("bd,bkd->bk", queries, candidates)
+            base_scores = torch.einsum("bd,bkd->bk", queries, normalized_candidates)
             film_scores = torch.einsum("bd,bkd->bk", queries, conditioned)
             scores = base_scores + args.score_alpha * (film_scores - base_scores)
 
@@ -507,8 +514,15 @@ def retrieve_film_variants(
                 documents = torch.from_numpy(
                     np.asarray(document_embeddings[start:end], dtype=np.float32)
                 ).to(device)
+                # Keep this branch as the official frozen baseline.  For
+                # Contriever/DPR this may be raw dot product, while the
+                # sentence-transformer baselines are already normalized.
                 baseline_scores = raw_query_batch @ documents.T
-                film_base_scores = query_batch @ documents.T
+                # The mixed FiLM score is defined in the same normalized
+                # space as film_scores, rather than interpolating a raw-dot
+                # baseline with a cosine-like conditioned score.
+                normalized_documents = F.normalize(documents, dim=-1)
+                film_base_scores = query_batch @ normalized_documents.T
                 conditioned = F.normalize(
                     gamma[:, None, :] * documents[None, :, :]
                     + beta[:, None, :],

@@ -24,7 +24,7 @@ Thumbs.db
 
 # Downloaded datasets and generated experiment artifacts
 /data/*
-/runs/*
+
 
 # Embeddings, checkpoints, and ranking outputs
 *.pt
@@ -35,11 +35,10 @@ Thumbs.db
 *.npy
 *.npz
 *.jsonl
-
+*.json
 # Logs and temporary files
 *.log
 *.tmp
 *.bak
 /tmp/
-/KGstark
 /promptodile

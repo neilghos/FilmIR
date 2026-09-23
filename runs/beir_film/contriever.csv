@@ -1,0 +1,14 @@
+# Hyperparameters: model=contriever, modulator=lowrank, low_rank=4, film_parameterization=rectangular, loss_type=infonce, temperature=0.05, modulation_scale=0.25, score_alpha=1.0, learning_rate=0.001, epochs=200, train_queries=8, modulation_mode=full
+dataset,baseline_ndcg10,film_mixed_ndcg10,film_only_ndcg10,delta_mixed,delta_only
+arguana,0.37644,0.51065,0.51065,0.13421,0.13421
+climate-fever,0.15328,0.27152,0.27152,0.11824,0.11824
+dbpedia-entity,0.29131,0.29949,0.29949,0.00818,0.00818
+fiqa,0.24497,0.17201,0.17201,-0.07296,-0.07296
+nfcorpus,0.31731,0.29624,0.29624,-0.02107,-0.02107
+scidocs,0.14814,0.15099,0.15099,0.00285,0.00285
+scifact,0.64925,0.63389,0.63389,-0.01536,-0.01536
+trec-covid,0.23964,0.48948,0.48948,0.24984,0.24984
+webis-touche2020,0.14861,0.18927,0.18927,0.04066,0.04066
+fever,0.68218,0.51441,0.51441,-0.16777,-0.16777
+hotpotqa,0.48067,0.43879,0.43879,-0.04188,-0.04188
+MACRO_AVERAGE,0.33925,0.36061,0.36061,0.02136,0.02136
