@@ -1,14 +1,14 @@
-# Hyperparameters: model=minilm, modulator=lowrank, low_rank=4, film_parameterization=rectangular, loss_type=infonce, temperature=0.05, modulation_scale=0.25, score_alpha=1.0, learning_rate=0.001, epochs=200, train_queries=8, modulation_mode=full
+# Hyperparameters: model=minilm, conditioner=lowrank, low_rank=4, film_parameterization=rectangular, canonicalizer=none, objective=infonce, temperature=0.05, modulation_scale=0.25, score_alpha=1.0, learning_rate=0.001, epochs=200, train_queries=8, modulation_mode=full
 dataset,baseline_ndcg10,film_mixed_ndcg10,film_only_ndcg10,delta_mixed,delta_only
-arguana,0.49822,0.51855,0.51855,0.02033,0.02033
-climate-fever,0.20158,0.2319,0.2319,0.03032,0.03032
-dbpedia-entity,0.3233,0.32848,0.32848,0.00518,0.00518
-fiqa,0.36867,0.36255,0.36255,-0.00612,-0.00612
-nfcorpus,0.31594,0.30839,0.30839,-0.00755,-0.00755
-scidocs,0.21511,0.21163,0.21163,-0.00348,-0.00348
-scifact,0.64508,0.64978,0.64978,0.0047,0.0047
-trec-covid,0.41199,0.56062,0.56062,0.14863,0.14863
-webis-touche2020,0.15345,0.21731,0.21731,0.06386,0.06386
-fever,0.51934,0.56372,0.56372,0.04438,0.04438
-hotpotqa,0.46513,0.46619,0.46619,0.00106,0.00106
-MACRO_AVERAGE,0.37435,0.40174,0.40174,0.02739,0.02739
+arguana,0.498,0.51909,0.51909,0.02109,0.02109
+climate-fever,0.20155,0.23177,0.23177,0.03022,0.03022
+dbpedia-entity,0.32362,0.32839,0.32839,0.00477,0.00477
+fiqa,0.36877,0.36274,0.36274,-0.00603,-0.00603
+nfcorpus,0.31591,0.3081,0.3081,-0.00781,-0.00781
+scidocs,0.21521,0.21165,0.21165,-0.00356,-0.00356
+scifact,0.6451,0.64978,0.64978,0.00468,0.00468
+trec-covid,0.41219,0.56121,0.56121,0.14902,0.14902
+webis-touche2020,0.15345,0.21725,0.21725,0.0638,0.0638
+fever,0.51927,0.56346,0.56346,0.04419,0.04419
+hotpotqa,0.46509,0.46624,0.46624,0.00115,0.00115
+MACRO_AVERAGE,0.37438,0.40179,0.40179,0.02741,0.02741

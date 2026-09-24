@@ -18,7 +18,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from film import FiLMConditioner, build_conditioner
+from film import CanonicalizedFiLM, LowRankFiLMConditioner
 from run_beir_baselines import (
     CACHE_VERSION,
     DATASETS,
@@ -87,8 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="runs/beir_film")
     parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=TARGET_DATASETS)
     parser.add_argument("--models", nargs="+", choices=list(MODELS), default=["minilm"])
-    parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--fold", type=int, default=0)
     parser.add_argument(
         "--train-queries",
         type=int,
@@ -96,8 +94,7 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Few-shot adaptation query count under the fixed Promptagator "
             "protocol. Test-only datasets exclude sampled test queries from "
-            "evaluation. 0 uses the full adaptation split or legacy five-fold "
-            "protocol."
+            "evaluation. 0 uses the full adaptation split when one exists."
         ),
     )
     parser.add_argument("--epochs", type=int, default=200)
@@ -107,38 +104,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=128)
     parser.add_argument("--film-chunk-size", type=int, default=65_536)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
-    parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument(
         "--film-parameterization",
         choices=("rectangular", "polar"),
-        default="polar",
+        default="rectangular",
         help="Bound FiLM modulation directly or in polar coordinates.",
     )
     parser.add_argument(
         "--modulation-scale",
         type=float,
-        default=0.15,
+        default=0.25,
         help="Maximum absolute FiLM delta/beta before score mixing.",
     )
     parser.add_argument(
         "--score-alpha",
         type=float,
-        default=0.35,
+        default=1.0,
         help="Weight of the FiLM score correction; 0 is the baseline.",
     )
     parser.add_argument("--modulation-regularization", type=float, default=0.02)
+    parser.add_argument("--low-rank", type=int, default=4, help="Bottleneck rank for the low-rank conditioner.")
     parser.add_argument(
-        "--modulator",
-        choices=("film", "lowrank"),
-        default="lowrank",
-        help="Conditioner network architecture: standard FiLM or parameter-efficient LowRank.",
-    )
-    parser.add_argument("--low-rank", type=int, default=4, help="Bottleneck rank for LowRank modulator.")
-    parser.add_argument(
-        "--loss-type",
-        choices=("bpr", "infonce"),
-        default="infonce",
-        help="Ranking loss function: pairwise BPR or Softmax Cross-Entropy InfoNCE.",
+        "--canonicalizer", choices=("none", "linear"), default="none",
+        help="Shared query/document coordinate transform before low-rank FiLM.",
     )
     parser.add_argument("--temperature", type=float, default=0.05, help="Temperature for InfoNCE ranking loss.")
     parser.add_argument(
@@ -147,29 +135,10 @@ def parse_args() -> argparse.Namespace:
         default="full",
         help="Components of FiLM modulation: full (gamma & beta), scale_only (gamma only), or shift_only (beta only).",
     )
-    parser.add_argument(
-        "--use-corpus-centroid",
-        action="store_true",
-        help="Inject normalized corpus document centroid into FiLM conditioner input.",
-    )
     parser.add_argument("--model-batch-size", type=int, default=512)
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
-
-
-def compute_corpus_centroid(document_embeddings: np.ndarray, chunk_size: int = 65_536) -> np.ndarray:
-    """Compute normalized corpus centroid in chunks for memory safety."""
-    num_docs, dim = document_embeddings.shape
-    total_sum = np.zeros(dim, dtype=np.float64)
-    for start in range(0, num_docs, chunk_size):
-        end = min(start + chunk_size, num_docs)
-        total_sum += np.sum(document_embeddings[start:end], axis=0, dtype=np.float64)
-    centroid = (total_sum / max(1, num_docs)).astype(np.float32)
-    norm = np.linalg.norm(centroid)
-    if norm > 1e-12:
-        centroid = centroid / norm
-    return centroid
 
 
 
@@ -272,17 +241,6 @@ def load_or_encode_corpus(
     return np.load(embedding_path, mmap_mode="r"), document_ids
 
 
-def split_query_ids(query_ids, folds: int, fold: int, seed: int):
-    if not 0 <= fold < folds:
-        raise ValueError(f"--fold must be between 0 and {folds - 1}")
-    order = np.random.default_rng(seed).permutation(len(query_ids))
-    parts = np.array_split(order, folds)
-    evaluation_indices = set(parts[fold].tolist())
-    train_ids = [query_ids[i] for i in range(len(query_ids)) if i not in evaluation_indices]
-    eval_ids = [query_ids[i] for i in parts[fold].tolist()]
-    return train_ids, eval_ids
-
-
 def sample_query_ids(query_ids, count: int, seed: int):
     """Sample a fixed few-shot adaptation set reproducibly."""
     query_ids = list(query_ids)
@@ -346,7 +304,6 @@ def train_conditioner(
     embedding_dim,
     args,
     device,
-    corpus_centroid=None,
 ):
     query_tensor = torch.from_numpy(np.asarray(query_embeddings, dtype=np.float32))
     dataset = CandidateDataset(
@@ -354,30 +311,20 @@ def train_conditioner(
         [example[1] for example in examples],
     )
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
-    use_centroid = getattr(args, "use_corpus_centroid", False)
-    modulator = getattr(args, "modulator", "film")
     low_rank = getattr(args, "low_rank", 4)
-    loss_type = getattr(args, "loss_type", "bpr")
+    canonicalizer = getattr(args, "canonicalizer", "none")
     temperature = getattr(args, "temperature", 0.05)
     modulation_mode = getattr(args, "modulation_mode", "full")
 
-    conditioner = build_conditioner(
-        embedding_dim=embedding_dim,
-        hidden_dim=args.hidden_dim,
+    conditioner_cls = CanonicalizedFiLM if canonicalizer == "linear" else LowRankFiLMConditioner
+    conditioner = conditioner_cls(
+        embedding_dim=embedding_dim, rank=low_rank,
         modulation_scale=args.modulation_scale,
         parameterization=args.film_parameterization,
-        modulator=modulator,
-        low_rank=low_rank,
-        use_corpus_centroid=use_centroid,
         modulation_mode=modulation_mode,
     ).to(device)
     optimizer = torch.optim.AdamW(conditioner.parameters(), lr=args.learning_rate)
 
-    centroid_tensor = (
-        torch.from_numpy(np.asarray(corpus_centroid, dtype=np.float32)).to(device)
-        if corpus_centroid is not None and use_centroid
-        else None
-    )
 
     for epoch in range(1, args.epochs + 1):
         conditioner.train()
@@ -396,23 +343,19 @@ def train_conditioner(
             # keeps its raw dot-product baseline.  Normalizing the unmodified
             # candidates here makes the score mixed with FiLM comparable to
             # the normalized conditioned-document score.
-            normalized_candidates = F.normalize(candidates, dim=-1)
-            conditioned = conditioner.condition(queries, candidates, corpus_centroid=centroid_tensor)
-            base_scores = torch.einsum("bd,bkd->bk", queries, normalized_candidates)
-            film_scores = torch.einsum("bd,bkd->bk", queries, conditioned)
+            canonical_queries = conditioner.query_embeddings(queries)
+            canonical_candidates = conditioner.document_embeddings(candidates)
+            normalized_candidates = F.normalize(canonical_candidates, dim=-1)
+            conditioned = conditioner.condition(queries, candidates)
+            base_scores = torch.einsum("bd,bkd->bk", canonical_queries, normalized_candidates)
+            film_scores = torch.einsum("bd,bkd->bk", canonical_queries, conditioned)
             scores = base_scores + args.score_alpha * (film_scores - base_scores)
 
-            if loss_type == "infonce":
-                scaled_scores = scores / temperature
-                targets = torch.zeros(scores.shape[0], dtype=torch.long, device=device)
-                ranking_loss = F.cross_entropy(scaled_scores, targets)
-            else:
-                positive_scores = scores[:, :1]
-                negative_scores = scores[:, 1:]
-                margins = positive_scores - negative_scores
-                ranking_loss = -F.logsigmoid(margins).mean()
+            scaled_scores = scores / temperature
+            targets = torch.zeros(scores.shape[0], dtype=torch.long, device=device)
+            ranking_loss = F.cross_entropy(scaled_scores, targets)
 
-            regularization = conditioner.regularization_loss(queries, corpus_centroid=centroid_tensor)
+            regularization = conditioner.regularization_loss(queries)
             loss = ranking_loss + args.modulation_regularization * regularization
             optimizer.zero_grad()
             loss.backward()
@@ -465,7 +408,6 @@ def retrieve_film_variants(
     score_alpha=0.1,
     chunk_size=65_536,
     query_chunk_size=64,
-    corpus_centroid=None,
 ):
     """Exact batched full-corpus retrieval for baseline and both FiLM scores.
 
@@ -480,12 +422,6 @@ def retrieve_film_variants(
     baseline_results = {}
     film_results = {}
     film_only_results = {}
-    use_centroid = getattr(conditioner, "use_corpus_centroid", False)
-    centroid_tensor = (
-        torch.from_numpy(np.asarray(corpus_centroid, dtype=np.float32)).to(device)
-        if corpus_centroid is not None and use_centroid
-        else None
-    )
 
     with torch.no_grad():
         for query_start in range(0, len(query_ids), query_chunk_size):
@@ -508,7 +444,7 @@ def retrieve_film_variants(
             film_indices = torch.zeros(shape, dtype=torch.long, device=device)
             film_only_values = torch.full(shape, -torch.inf, device=device)
             film_only_indices = torch.zeros(shape, dtype=torch.long, device=device)
-            gamma, beta = conditioner(query_batch, corpus_centroid=centroid_tensor)
+            gamma, beta = conditioner(query_batch)
             for start in range(0, len(document_ids), effective_chunk_size):
                 end = min(start + effective_chunk_size, len(document_ids))
                 documents = torch.from_numpy(
@@ -613,9 +549,10 @@ def update_model_csv(csv_path: Path, model_key: str, args: argparse.Namespace, r
     all_rows = rows + [mean_row]
 
     header_comment = (
-        f"# Hyperparameters: model={model_key}, modulator={getattr(args, 'modulator', 'lowrank')}, "
+        f"# Hyperparameters: model={model_key}, conditioner=lowrank, "
         f"low_rank={getattr(args, 'low_rank', 4)}, film_parameterization={args.film_parameterization}, "
-        f"loss_type={getattr(args, 'loss_type', 'infonce')}, temperature={getattr(args, 'temperature', 0.05)}, "
+        f"canonicalizer={getattr(args, 'canonicalizer', 'none')}, "
+        f"objective=infonce, temperature={getattr(args, 'temperature', 0.05)}, "
         f"modulation_scale={args.modulation_scale}, score_alpha={args.score_alpha}, "
         f"learning_rate={args.learning_rate}, epochs={args.epochs}, "
         f"train_queries={args.train_queries}, modulation_mode={getattr(args, 'modulation_mode', 'full')}\n"
@@ -655,7 +592,6 @@ def main():
             dataset_dir = download_dataset(dataset_name, Path(args.data_dir))
             adaptation_split = PROMPTAGATOR_ADAPTATION_SPLITS[dataset_name]
             eval_split = "test"
-            cross_validate = adaptation_split == "test"
             test_support_ids = []
             if adaptation_split == "test":
                 all_queries, all_qrels, all_ids = load_beir_split_metadata(dataset_dir, "test")
@@ -663,10 +599,10 @@ def main():
                     train_ids = sample_query_ids(all_ids, args.train_queries, args.seed)
                     test_support_ids = list(train_ids)
                     eval_ids = list(all_ids)
-                    cross_validate = False
                 else:
-                    train_ids, eval_ids = split_query_ids(
-                        all_ids, args.folds, args.fold, args.seed
+                    raise ValueError(
+                        f"{dataset_name} has no separate adaptation split; "
+                        "use --train-queries with a positive value."
                     )
                 train_qrels = all_qrels
                 eval_qrels = all_qrels
@@ -751,10 +687,6 @@ def main():
                 documents[global_candidates], dtype=np.float32
             )
 
-            if args.use_corpus_centroid:
-                corpus_centroid = compute_corpus_centroid(documents)
-            else:
-                corpus_centroid = None
 
             print(
                 f"[{model_key}] {dataset_name}: train={len(train_ids)}, "
@@ -768,7 +700,6 @@ def main():
                 train_embeddings.shape[1],
                 args,
                 device,
-                corpus_centroid=corpus_centroid,
             )
             eval_qrels_subset = {
                 query_id: eval_qrels[query_id]
@@ -798,7 +729,6 @@ def main():
                 device,
                 score_alpha=args.score_alpha,
                 chunk_size=args.film_chunk_size,
-                corpus_centroid=corpus_centroid,
             )
             if test_support_ids:
                 assign_zero_credit(baseline_eval_results, test_support_ids)
