@@ -113,8 +113,14 @@ class LowRankFiLMConditioner(nn.Module):
         raw_first, raw_second = self.up(h).chunk(2, dim=-1)
         if self.parameterization == "polar":
             radius = self.modulation_scale * torch.tanh(raw_first)
-            gamma_delta = radius * torch.cos(raw_second)
-            beta = radius * torch.sin(raw_second)
+            angle = raw_second
+            # In shift-only mode, rotate the polar vector before applying
+            # the mode mask so the full bounded radius is used as beta
+            # instead of retaining only the accidental sine component.
+            if self.modulation_mode == "shift_only":
+                angle = angle + torch.pi / 2.0
+            gamma_delta = radius * torch.cos(angle)
+            beta = radius * torch.sin(angle)
         else:
             gamma_delta = self.modulation_scale * torch.tanh(raw_first)
             beta = self.modulation_scale * torch.tanh(raw_second)
