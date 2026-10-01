@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -78,6 +79,21 @@ class CandidateDataset(Dataset):
 
     def __getitem__(self, index):
         return self.query_indices[index], self.candidate_indices[index]
+
+
+def seed_everything(seed: int) -> None:
+    """Reset all experiment RNGs so runs do not depend on dataset order."""
+    random.seed(seed)
+    np.random.seed(seed % (2**32 - 1))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def experiment_seed(base_seed: int, model_key: str, dataset_name: str) -> int:
+    """Derive a stable seed for one model/dataset pair."""
+    material = f"{base_seed}:{model_key}:{dataset_name}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(material).digest()[:4], "little")
 
 
 def parse_args() -> argparse.Namespace:
@@ -589,6 +605,8 @@ def main():
         csv_path = output_root / f"{model_key}.csv"
 
         for dataset_name in args.datasets:
+            dataset_seed = experiment_seed(args.seed, model_key, dataset_name)
+            seed_everything(dataset_seed)
             dataset_dir = download_dataset(dataset_name, Path(args.data_dir))
             adaptation_split = PROMPTAGATOR_ADAPTATION_SPLITS[dataset_name]
             eval_split = "test"
@@ -691,8 +709,11 @@ def main():
             print(
                 f"[{model_key}] {dataset_name}: train={len(train_ids)}, "
                 f"eval={len(eval_ids)}, examples={len(examples)}, "
-                f"candidate_documents={len(global_candidates)}"
+                f"candidate_documents={len(global_candidates)}, seed={dataset_seed}"
             )
+            # Reset after encoder inference so conditioner initialization and
+            # DataLoader shuffling are independent of dataset order.
+            seed_everything(dataset_seed)
             conditioner = train_conditioner(
                 train_embeddings,
                 training_documents,
