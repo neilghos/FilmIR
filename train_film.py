@@ -33,8 +33,11 @@ from run_beir_baselines import (
     retrieve,
 )
 
-# Fixed Promptagator-style few-shot protocol used by the final-test path.
-# These are deliberately explicit rather than inferred from files on disk.
+# Fixed Promptagator-style few-shot protocol.  These are deliberately
+# explicit rather than inferred from files on disk: adaptation uses the BEIR
+# dev split first, then train when dev is unavailable, while test-only
+# datasets draw the few-shot examples from test and remove them from the
+# evaluation set.
 PROMPTAGATOR_ADAPTATION_SPLITS = {
     "nfcorpus": "dev",
     "scifact": "train",
@@ -47,28 +50,6 @@ PROMPTAGATOR_ADAPTATION_SPLITS = {
     "climate-fever": "test",
     "fever": "dev",
     "hotpotqa": "dev",
-}
-
-# Paper-facing validation protocol. The eight support queries are sampled
-# only from a non-test split. The remaining queries from the same split,
-# together with the listed companion split when present, are used only for
-# configuration/checkpoint selection. Test queries are never touched here.
-VALIDATION_ADAPTATION_SPLITS = {
-    "nfcorpus": "train",
-    "fiqa": "train",
-    "fever": "train",
-    "hotpotqa": "train",
-    "scifact": "train",
-    "dbpedia-entity": "dev",
-}
-
-VALIDATION_EVAL_SPLITS = {
-    "nfcorpus": ("train", "dev"),
-    "fiqa": ("train", "dev"),
-    "fever": ("train", "dev"),
-    "hotpotqa": ("train", "dev"),
-    "scifact": ("train",),
-    "dbpedia-entity": ("dev",),
 }
 
 TARGET_DATASETS = [
@@ -106,16 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="runs/beir_film")
     parser.add_argument("--datasets", nargs="+", choices=list(DATASETS), default=TARGET_DATASETS)
     parser.add_argument("--models", nargs="+", choices=list(MODELS), default=["minilm"])
-    parser.add_argument(
-        "--mode",
-        choices=("validation", "test"),
-        default="test",
-        help=(
-            "validation: adapt on eight non-test support queries and evaluate "
-            "on the disjoint validation pool; test: run the final protocol "
-            "and evaluate on the untouched BEIR test split."
-        ),
-    )
     parser.add_argument(
         "--train-queries",
         type=int,
@@ -276,25 +247,6 @@ def sample_query_ids(query_ids, count: int, seed: int):
     if count <= 0 or count >= len(query_ids):
         return query_ids
     return random.Random(seed).sample(query_ids, count)
-
-
-def load_merged_split_metadata(dataset_dir: Path, splits):
-    """Return concatenated query/qrel metadata for a fixed split union."""
-    merged_queries = {}
-    merged_qrels = {}
-    merged_ids = []
-    for split in splits:
-        queries, qrels, query_ids = load_beir_split_metadata(dataset_dir, split)
-        overlap = set(merged_ids).intersection(query_ids)
-        if overlap:
-            raise ValueError(
-                f"Query IDs overlap across BEIR splits {splits}: "
-                f"{sorted(overlap)[:3]}"
-            )
-        merged_queries.update(queries)
-        merged_qrels.update(qrels)
-        merged_ids.extend(query_ids)
-    return merged_queries, merged_qrels, merged_ids
 
 
 def assign_zero_credit(results: dict, query_ids):
@@ -603,8 +555,7 @@ def update_model_csv(csv_path: Path, model_key: str, args: argparse.Namespace, r
         f"objective=infonce, temperature={getattr(args, 'temperature', 0.05)}, "
         f"modulation_scale={args.modulation_scale}, score_alpha={args.score_alpha}, "
         f"learning_rate={args.learning_rate}, epochs={args.epochs}, "
-        f"train_queries={args.train_queries}, mode={getattr(args, 'mode', 'test')}, "
-        f"modulation_mode={getattr(args, 'modulation_mode', 'full')}\n"
+        f"train_queries={args.train_queries}, modulation_mode={getattr(args, 'modulation_mode', 'full')}\n"
     )
 
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -639,52 +590,13 @@ def main():
 
         for dataset_name in args.datasets:
             dataset_dir = download_dataset(dataset_name, Path(args.data_dir))
-            # The six datasets with non-test supervision use the new
-            # support split in both modes. Validation mode evaluates on the
-            # disjoint non-test pool; test mode skips validation and evaluates
-            # on the untouched test split. The five test-only datasets retain
-            # the existing Promptagator-style test-support path.
-            new_protocol = dataset_name in VALIDATION_ADAPTATION_SPLITS
-            validation_protocol = args.mode == "validation" and new_protocol
+            adaptation_split = PROMPTAGATOR_ADAPTATION_SPLITS[dataset_name]
+            eval_split = "test"
             test_support_ids = []
-            if new_protocol:
-                adaptation_split = VALIDATION_ADAPTATION_SPLITS[dataset_name]
-                _, train_qrels, available_train_ids = load_beir_split_metadata(
-                    dataset_dir, adaptation_split
-                )
-                train_ids = sample_query_ids(
-                    available_train_ids, args.train_queries, args.seed
-                )
-                if validation_protocol:
-                    validation_splits = VALIDATION_EVAL_SPLITS[dataset_name]
-                    _, eval_qrels, merged_eval_ids = load_merged_split_metadata(
-                        dataset_dir, validation_splits
-                    )
-                    support_set = set(train_ids)
-                    eval_ids = [
-                        query_id
-                        for query_id in merged_eval_ids
-                        if query_id not in support_set
-                    ]
-                    eval_split = None
-                else:
-                    eval_split = "test"
-                    _, eval_qrels, eval_ids = load_beir_split_metadata(
-                        dataset_dir, eval_split
-                    )
-            else:
-                adaptation_split = PROMPTAGATOR_ADAPTATION_SPLITS[dataset_name]
-                eval_split = "test"
-                _, all_qrels, all_ids = load_beir_split_metadata(
-                    dataset_dir, "test"
-                )
+            if adaptation_split == "test":
+                all_queries, all_qrels, all_ids = load_beir_split_metadata(dataset_dir, "test")
                 if args.train_queries > 0:
-                    train_ids = sample_query_ids(
-                        all_ids, args.train_queries, args.seed
-                    )
-                    # Preserve the existing test-only protocol: support
-                    # queries stay in the denominator and receive zero credit
-                    # rather than being scored normally.
+                    train_ids = sample_query_ids(all_ids, args.train_queries, args.seed)
                     test_support_ids = list(train_ids)
                     eval_ids = list(all_ids)
                 else:
@@ -694,6 +606,11 @@ def main():
                     )
                 train_qrels = all_qrels
                 eval_qrels = all_qrels
+            else:
+                _, train_qrels, train_ids = load_beir_split_metadata(dataset_dir, adaptation_split)
+                _, eval_qrels, eval_ids = load_beir_split_metadata(dataset_dir, eval_split)
+                if args.train_queries > 0 and len(train_ids) > args.train_queries:
+                    train_ids = sample_query_ids(train_ids, args.train_queries, args.seed)
 
             spec = MODELS[model_key]
             model = load_encoder(model_key, device)
@@ -714,68 +631,13 @@ def main():
                 model,
                 args.model_batch_size,
             )
+            eval_embeddings, cached_eval_ids = load_or_encode_queries(
+                dataset_name, dataset_dir, model_key, eval_split, cache_root, model, args.model_batch_size
+            )
             train_position = {query_id: i for i, query_id in enumerate(cached_train_ids)}
-            missing_train = [query_id for query_id in train_ids if query_id not in train_position]
-            if missing_train:
-                raise KeyError(
-                    f"Missing cached {adaptation_split} embeddings for "
-                    f"{dataset_name}: {missing_train[:3]}"
-                )
-            train_embeddings = train_embeddings[
-                [train_position[query_id] for query_id in train_ids]
-            ]
-
-            if validation_protocol:
-                eval_embedding_parts = []
-                eval_id_set = set(eval_ids)
-                for split in validation_splits:
-                    _, _, split_ids = load_beir_split_metadata(dataset_dir, split)
-                    split_eval_ids = [
-                        query_id for query_id in split_ids if query_id in eval_id_set
-                    ]
-                    if not split_eval_ids:
-                        continue
-                    split_embeddings, cached_split_ids = load_or_encode_queries(
-                        dataset_name,
-                        dataset_dir,
-                        model_key,
-                        split,
-                        cache_root,
-                        model,
-                        args.model_batch_size,
-                    )
-                    split_position = {
-                        query_id: i for i, query_id in enumerate(cached_split_ids)
-                    }
-                    eval_embedding_parts.append(
-                        split_embeddings[
-                            [split_position[query_id] for query_id in split_eval_ids]
-                        ]
-                    )
-                eval_embeddings = np.concatenate(eval_embedding_parts, axis=0)
-                # Keep metadata and embedding rows in exactly the same order.
-                eval_ids = [
-                    query_id
-                    for split in validation_splits
-                    for query_id in load_beir_split_metadata(dataset_dir, split)[2]
-                    if query_id in eval_id_set
-                ]
-            else:
-                eval_embeddings, cached_eval_ids = load_or_encode_queries(
-                    dataset_name,
-                    dataset_dir,
-                    model_key,
-                    eval_split,
-                    cache_root,
-                    model,
-                    args.model_batch_size,
-                )
-                eval_position = {
-                    query_id: i for i, query_id in enumerate(cached_eval_ids)
-                }
-                eval_embeddings = eval_embeddings[
-                    [eval_position[query_id] for query_id in eval_ids]
-                ]
+            eval_position = {query_id: i for i, query_id in enumerate(cached_eval_ids)}
+            train_embeddings = train_embeddings[[train_position[q] for q in train_ids]]
+            eval_embeddings = eval_embeddings[[eval_position[q] for q in eval_ids]]
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
